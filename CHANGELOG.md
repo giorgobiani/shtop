@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.2.0 — 2026-10-04
+
+- Opens on the list of individual processes, each with its PID. Press `g`
+  (or start with `-a` / `--apps`) for the grouped-by-app view, which now shows
+  the PID of each app's main process too.
+
 ## 1.1.0 — 2026-10-04
 
 - Refresh every 2 seconds by default instead of every second: calmer to

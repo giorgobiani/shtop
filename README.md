@@ -29,14 +29,16 @@ single Python script with no dependencies beyond Python itself.
 - **Power & Sensors:** battery with time left ("On battery · 3h 20m left"),
   temperatures, fans and GPU usage (AMD and NVIDIA), when the hardware
   reports them.
-- **Apps:** everything running, grouped by app so a browser with twenty
-  processes is one row, with icons, a CPU trend sparkline, memory and user.
-  CPU % is a share of the whole machine: 100% means every core is busy.
+- **Processes:** everything running, with PID, icon, a CPU trend sparkline,
+  memory, state, user and command line. Press <kbd>g</kbd> to group them by
+  app, so a browser with twenty processes becomes one row. CPU % is a share of
+  the whole machine: 100% means every core is busy.
 
-Press <kbd>Enter</kbd> on an app to see its CPU over the last minute, every
-process it's made of, the program, folder, start time and command line.
+Press <kbd>Enter</kbd> on a process to see its CPU over the last minute, its
+parent, the program, folder, start time and command line. On an app, it also
+lists every process the app is made of.
 
-![Details for an app](docs/details.png)
+![Details for a process](docs/details.png)
 
 Light themes work too:
 
@@ -86,6 +88,7 @@ Or copy the `shtop` file anywhere on your `PATH`. Uninstall with
 ```
 shtop                   run it
 shtop -i 1              refresh processes every second (0.5–8, default 2)
+shtop -a                start grouped by app instead of one row per process
 shtop --no-animation    update numbers instantly (uses less CPU)
 shtop --no-icons        plain symbols, for terminals without a Nerd Font
 shtop --dump 120x40     print a single frame and exit
@@ -94,11 +97,11 @@ shtop --dump 120x40     print a single frame and exit
 | Key | Does |
 |-----|------|
 | <kbd>↑</kbd> <kbd>↓</kbd> or <kbd>j</kbd> <kbd>k</kbd> | Move the selection (<kbd>PgUp</kbd> <kbd>PgDn</kbd> <kbd>Home</kbd> <kbd>End</kbd> jump) |
-| <kbd>Enter</kbd> or click | Details for the selected app |
+| <kbd>Enter</kbd> or click | Details for the selected process or app |
 | <kbd>/</kbd> | Search by name, command line or PID (<kbd>Esc</kbd> clears) |
-| <kbd>g</kbd> | Switch between apps and individual processes |
+| <kbd>g</kbd> | Switch between individual processes and apps (grouped by name) |
 | <kbd>s</kbd> | Next sort; <kbd>c</kbd> <kbd>m</kbd> <kbd>n</kbd> <kbd>p</kbd> sort by CPU, memory, name, PID; <kbd>r</kbd> reverses. Clicking a column header sorts too |
-| <kbd>Del</kbd> or <kbd>x</kbd> | End the app nicely (SIGTERM), after confirming |
+| <kbd>Del</kbd> or <kbd>x</kbd> | End the process (or every process of the app) nicely (SIGTERM), after confirming |
 | <kbd>Shift</kbd>+<kbd>Del</kbd> or <kbd>X</kbd> | Force-end it (SIGKILL), after confirming |
 | <kbd>t</kbd> | Show or hide kernel tasks |
 | <kbd>a</kbd> | Animations on or off |

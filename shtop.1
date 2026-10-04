@@ -1,4 +1,4 @@
-.TH SHTOP 1 "2026-10-04" "shtop 1.1.0" "User Commands"
+.TH SHTOP 1 "2026-10-04" "shtop 1.2.0" "User Commands"
 .nh
 .ad l
 .SH NAME
@@ -7,6 +7,7 @@ shtop \- a calm, readable system monitor for the terminal
 .B shtop
 .RB [ \-i
 .IR SECONDS ]
+.RB [ \-a ]
 .RB [ \-\-no\-animation ]
 .RB [ \-\-icons | \-\-no\-icons ]
 .RB [ \-\-dump
@@ -20,7 +21,9 @@ the system is doing, for example
 or
 \fI\(lqMemory is almost full \- chromium holds 2.1 GB\(rq\fR.
 .PP
-Apps are grouped by name, so a browser with twenty processes is one row.
+Every process is listed with its PID; press
+.B g
+to group them by app, so a browser with twenty processes is one row.
 Press
 .B ?
 inside shtop for a guide to every panel and key.
@@ -35,6 +38,9 @@ directly and needs nothing beyond Python 3.11 or newer.
 .BR \-i ", " \-\-interval " " \fISECONDS\fR
 How often processes and drives refresh, from 0.5 to 8 seconds (default 2).
 CPU, memory and network graphs sample twice as often.
+.TP
+.BR \-a ", " \-\-apps
+Start with processes grouped by app instead of listed one by one.
 .TP
 .B \-\-no\-animation
 Update numbers instantly instead of easing them. Uses less CPU.
@@ -69,7 +75,8 @@ Search by name, command line or PID.
 clears the search.
 .TP
 .B g
-Switch between apps (grouped by name) and individual processes.
+Switch between individual processes and apps (processes grouped by name,
+shown with the PID of the main process).
 .TP
 .BR s ", " c ", " m ", " n ", " p ", " r
 Next sort; sort by CPU, memory, name or PID; reverse the sort.

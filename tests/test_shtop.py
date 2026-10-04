@@ -306,6 +306,26 @@ class RenderTests(unittest.TestCase):
         for title in ("CPU", "Memory", "Network", "Storage", "Apps"):
             self.assertIn(title, text)
 
+    def test_processes_with_pid_by_default(self):
+        self.assertFalse(shtop.App(animate=False).grouped)
+        self.assertTrue(shtop.App(animate=False, grouped=True).grouped)
+        self.assertFalse(shtop.parse_args([]).apps)
+        self.assertTrue(shtop.parse_args(["--apps"]).apps)
+
+    def test_pid_column_in_both_views(self):
+        for grouped in (False, True):
+            for width in (60, 80, 150):
+                with self.subTest(grouped=grouped, width=width):
+                    keys = [c[0] for c in self.app.columns(width - 4)]
+                    self.assertIn("pid", keys)
+                    self.assertTrue(all(w > 0 for _, _, w in self.app.columns(width - 4)))
+        self.app.grouped = False
+        self.app.build_rows()
+        self.app.scr.resize(150, 45)
+        self.app.render()
+        top = self.app.rows[0]
+        self.assertIn(str(top.pid), self.text())
+
     def test_too_small_message(self):
         self.app.scr.resize(40, 10)
         self.app.render()

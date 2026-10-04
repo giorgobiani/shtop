@@ -34,7 +34,7 @@ import tty
 import zlib
 from collections import deque
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 DEFAULT_INTERVAL = 2.0  # seconds between process/drive refreshes; graphs sample twice as often
 
 CONFIG_HOME = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
@@ -1004,7 +1004,7 @@ def _app_icon(name, kernel, T):
 
 
 class App:
-    def __init__(self, theme=None, interval=DEFAULT_INTERVAL, animate=True):
+    def __init__(self, theme=None, interval=DEFAULT_INTERVAL, animate=True, grouped=False):
         self.theme = theme or Theme()
         self.scr = Screen()
         self.anim = Anim()
@@ -1014,7 +1014,7 @@ class App:
         self.hostname = socket.gethostname()
         self.interval = interval
         self.anim.enabled = animate
-        self.grouped = True
+        self.grouped = grouped
         self.show_kernel = False
         self.sort, self.reverse = "cpu", False
         self.filter, self.filtering = "", False
@@ -1597,8 +1597,8 @@ class App:
     # ── process table ──
     def columns(self, iw):
         if self.grouped:
-            cols = [("name", "App", 0), ("count", "Procs", 5), ("cpu", "CPU", 13), ("trend", "Trend", 10),
-                    ("mem", "Memory", 16), ("user", "User", 10)]
+            cols = [("name", "App", 0), ("pid", "PID", 8), ("count", "Procs", 5), ("cpu", "CPU", 13),
+                    ("trend", "Trend", 10), ("mem", "Memory", 16), ("user", "User", 10)]
             if iw > 120:
                 cols.append(("cmd", "Command", 0))
         else:
@@ -1854,8 +1854,10 @@ class App:
             (ICON["DISK"], "Storage", T.yellow, "How full each drive is, and whether anything is reading or "
              "writing right now."),
             (ICON["BOLT"], "Power", T.orange, "Battery, temperatures and fans when your hardware reports them."),
-            (ICON["APPS"], "Apps", T.accent, "Everything running, grouped by app. CPU % is a share of the whole "
-             "machine: 100% means every core is fully busy. Trend shows the last few seconds."),
+            (ICON["APPS"], "Processes", T.accent, "Everything running, one row per process with its PID. Press g "
+             "to group them by app, so a browser's twenty processes become one row (PID is then its main "
+             "process). CPU % is a share of the whole machine: 100% means every core is fully busy. Trend "
+             "shows the last few seconds."),
         ]
         keys = [("↑↓ j k", "move"), ("PgUp PgDn", "page"), ("⏎ click", "details"),
                 ("/", "search"), ("g", "apps ⇄ processes"), ("s", "next sort"),
@@ -2143,7 +2145,7 @@ def run(opts):
     tty.setraw(fd)
     try:
         palette = query_terminal_palette(fd, out) if theme_file()[0] is None else None
-        app = App(Theme(palette), interval=opts.interval, animate=not opts.no_animation)
+        app = App(Theme(palette), interval=opts.interval, animate=not opts.no_animation, grouped=opts.apps)
     except BaseException:
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
         raise
@@ -2225,7 +2227,7 @@ def run(opts):
 
 def dump(w, h, opts):
     """Render one frame to stdout, e.g. for screenshots: shtop --dump 120x40"""
-    app = App(interval=opts.interval, animate=False)
+    app = App(interval=opts.interval, animate=False, grouped=opts.apps)
     app.sample_fast()
     app.sample()
     n = int(os.environ.get("SHTOP_DUMP_SAMPLES", "3"))
@@ -2272,6 +2274,8 @@ def parse_args(argv=None):
                "or your terminal's palette.")
     p.add_argument("-i", "--interval", type=interval, default=DEFAULT_INTERVAL, metavar="SECONDS",
                    help=f"how often processes and drives refresh (0.5–8, default {DEFAULT_INTERVAL:g})")
+    p.add_argument("-a", "--apps", action="store_true",
+                   help="start with processes grouped by app (press g to switch)")
     p.add_argument("--no-animation", action="store_true",
                    help="update numbers instantly instead of easing them (uses less CPU)")
     icons = p.add_mutually_exclusive_group()

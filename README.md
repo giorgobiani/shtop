@@ -44,12 +44,22 @@ Light themes work too:
 
 ## Install
 
-**Arch Linux and Omarchy**, from the [AUR](https://aur.archlinux.org/packages/shtop):
+**Arch Linux and Omarchy**, the package from the latest release:
 
 ```bash
-yay -S shtop                  # or: paru -S shtop
-omarchy pkg aur add shtop     # on Omarchy
+sudo pacman -U https://github.com/giorgobiani/shtop/releases/download/v1.0.0/shtop-1.0.0-1-any.pkg.tar.zst
 ```
+
+Remove it with `sudo pacman -R shtop`. Or build the package yourself:
+
+```bash
+git clone https://github.com/giorgobiani/shtop.git
+cd shtop/packaging/arch
+makepkg -si
+```
+
+An [AUR](https://aur.archlinux.org/) package (`yay -S shtop`) is on the way;
+new AUR accounts are paused for now.
 
 **Any Linux**, from source:
 

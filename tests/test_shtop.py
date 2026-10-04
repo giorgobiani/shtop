@@ -346,6 +346,12 @@ class CommandLineTests(unittest.TestCase):
         with self.assertRaises(SystemExit), mock.patch("sys.stderr"):
             shtop.parse_args(["--dump", "wide"])
 
+    def test_versions_agree(self):
+        pkgbuild = (ROOT / "packaging" / "arch" / "PKGBUILD").read_text()
+        self.assertIn(f"pkgver={shtop.VERSION}\n", pkgbuild)
+        self.assertIn(f'"shtop {shtop.VERSION}"', (ROOT / "shtop.1").read_text())
+        self.assertIn(f"## {shtop.VERSION} ", (ROOT / "CHANGELOG.md").read_text())
+
     def test_version(self):
         out = subprocess.run([sys.executable, str(SCRIPT), "--version"], capture_output=True, text=True)
         self.assertEqual(out.stdout.strip(), f"shtop {shtop.VERSION}")

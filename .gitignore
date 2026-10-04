@@ -1,3 +1,6 @@
 __pycache__/
 *.pyc
 .ruff_cache/
+packaging/arch/src/
+packaging/arch/pkg/
+packaging/arch/*.pkg.tar.*

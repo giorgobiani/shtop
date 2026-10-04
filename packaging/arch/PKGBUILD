@@ -1,0 +1,25 @@
+# Maintainer: Shota Giorgobiani <shota at giorgobiani dot ge>
+#
+# Builds the package from this checkout:  cd packaging/arch && makepkg -si
+# The AUR package uses the same recipe with the release tarball as its source.
+
+pkgname=shtop
+pkgver=1.0.0
+pkgrel=1
+pkgdesc='Calm, readable terminal system monitor that explains what your computer is doing'
+arch=('any')
+url='https://github.com/giorgobiani/shtop'
+license=('MIT')
+depends=('python')
+optdepends=('ttf-nerd-fonts-symbols-mono: icons in any terminal font'
+            'nvidia-utils: NVIDIA GPU usage')
+
+check() {
+  cd "$startdir/../.."
+  python -m unittest discover -s tests
+}
+
+package() {
+  cd "$startdir/../.."
+  make DESTDIR="$pkgdir" PREFIX=/usr install
+}

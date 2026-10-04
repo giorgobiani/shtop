@@ -14,7 +14,7 @@ depends=('python')
 optdepends=('ttf-nerd-fonts-symbols-mono: icons in any terminal font'
             'nvidia-utils: NVIDIA GPU usage')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('f222703c9d680422e20cb7318cb0ae4626433bfc29de08d7dffadee8242e95ca')
+sha256sums=('adccae4c8ce81a9df6be2d2182b0dfb7b49ed5617bdd6197b9392c5b9f3c6acc')
 
 check() {
   cd "$pkgname-$pkgver"

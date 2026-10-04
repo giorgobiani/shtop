@@ -34,7 +34,8 @@ import tty
 import zlib
 from collections import deque
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
+DEFAULT_INTERVAL = 2.0  # seconds between process/drive refreshes; graphs sample twice as often
 
 CONFIG_HOME = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
 USER_THEME = os.path.join(CONFIG_HOME, "shtop", "colors.toml")
@@ -1003,7 +1004,7 @@ def _app_icon(name, kernel, T):
 
 
 class App:
-    def __init__(self, theme=None, interval=1.0, animate=True):
+    def __init__(self, theme=None, interval=DEFAULT_INTERVAL, animate=True):
         self.theme = theme or Theme()
         self.scr = Screen()
         self.anim = Anim()
@@ -1333,7 +1334,7 @@ class App:
             if x + need > W:
                 break
             x += self.keycap(x, y, k, label) + 2
-        if self.interval != 1.0 and x + 12 < W:
+        if self.interval != DEFAULT_INTERVAL and x + 12 < W:
             t = f"every {self.interval:g}s"
             s.put(W - len(t) - 1, y, t, T.dim)
 
@@ -2269,8 +2270,8 @@ def parse_args(argv=None):
         epilog="Inside shtop, press ? for a guide to every panel and key. "
                "Colours follow the current Omarchy theme, ~/.config/shtop/colors.toml, "
                "or your terminal's palette.")
-    p.add_argument("-i", "--interval", type=interval, default=1.0, metavar="SECONDS",
-                   help="how often processes and drives refresh (0.5–8, default 1)")
+    p.add_argument("-i", "--interval", type=interval, default=DEFAULT_INTERVAL, metavar="SECONDS",
+                   help=f"how often processes and drives refresh (0.5–8, default {DEFAULT_INTERVAL:g})")
     p.add_argument("--no-animation", action="store_true",
                    help="update numbers instantly instead of easing them (uses less CPU)")
     icons = p.add_mutually_exclusive_group()

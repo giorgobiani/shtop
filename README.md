@@ -47,7 +47,7 @@ Light themes work too:
 **Arch Linux and Omarchy**, the package from the latest release:
 
 ```bash
-sudo pacman -U https://github.com/giorgobiani/shtop/releases/download/v1.0.0/shtop-1.0.0-1-any.pkg.tar.zst
+sudo pacman -U https://github.com/giorgobiani/shtop/releases/download/v1.1.0/shtop-1.1.0-1-any.pkg.tar.zst
 ```
 
 Remove it with `sudo pacman -R shtop`. Or build the package yourself:
@@ -85,7 +85,7 @@ Or copy the `shtop` file anywhere on your `PATH`. Uninstall with
 
 ```
 shtop                   run it
-shtop -i 2              refresh processes every 2 seconds (0.5–8, default 1)
+shtop -i 1              refresh processes every second (0.5–8, default 2)
 shtop --no-animation    update numbers instantly (uses less CPU)
 shtop --no-icons        plain symbols, for terminals without a Nerd Font
 shtop --dump 120x40     print a single frame and exit
@@ -152,14 +152,14 @@ o.bind("SUPER + CTRL + T", "Activity", { tui = "shtop" })
 
 ## How it works
 
-Every half second shtop reads CPU, memory and network counters from `/proc`;
-every second (`-i`) it reads processes, drives, sensors and battery from
+Every second shtop reads CPU, memory and network counters from `/proc`;
+every two seconds (`-i`) it reads processes, drives, sensors and battery from
 `/proc` and `/sys`. The screen is drawn into a buffer and only rows that
 changed are sent to the terminal, inside synchronized-update markers so
 nothing flickers. Numbers ease towards new values over about a quarter of a
 second.
 
-It uses about 6% of one CPU core with animations on, and about 3% with
+It uses about 3% of one CPU core with animations on, and about 1% with
 `--no-animation`.
 
 ## Development

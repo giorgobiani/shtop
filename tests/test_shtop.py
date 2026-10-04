@@ -340,7 +340,8 @@ class RenderTests(unittest.TestCase):
 
 class CommandLineTests(unittest.TestCase):
     def test_interval_bounds(self):
-        self.assertEqual(shtop.parse_args(["-i", "2"]).interval, 2.0)
+        self.assertEqual(shtop.parse_args([]).interval, 2.0)
+        self.assertEqual(shtop.parse_args(["-i", "1"]).interval, 1.0)
         with self.assertRaises(SystemExit), mock.patch("sys.stderr"):
             shtop.parse_args(["-i", "0.1"])
         with self.assertRaises(SystemExit), mock.patch("sys.stderr"):

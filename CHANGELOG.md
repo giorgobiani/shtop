@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.1.0 — 2026-10-04
+
+- Refresh every 2 seconds by default instead of every second: calmer to
+  read and lighter on the CPU. Graphs now sample every second and show twice
+  as much history. `-i 1` (or `+` while running) brings back the old pace.
+
 ## 1.0.0 — 2026-10-04
 
 First release.

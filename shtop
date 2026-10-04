@@ -1,0 +1,2303 @@
+#!/usr/bin/env python3
+"""
+shtop — a calm, readable system monitor for the terminal.
+
+Reads everything straight from /proc and /sys, with no dependencies beyond
+Python. Colours come from (first match wins):
+
+  1. $SHTOP_THEME, a colors.toml file
+  2. ~/.config/shtop/colors.toml
+  3. the current Omarchy theme (followed live as you switch themes)
+  4. your terminal's own palette, asked for at startup
+  5. a built-in palette
+
+Press ? inside shtop for a guide to every panel and key.
+"""
+
+import argparse
+import glob
+import math
+import os
+import pwd
+import re
+import select
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import termios
+import textwrap
+import time
+import tomllib
+import tty
+import zlib
+from collections import deque
+
+VERSION = "1.0.0"
+
+CONFIG_HOME = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+USER_THEME = os.path.join(CONFIG_HOME, "shtop", "colors.toml")
+OMARCHY_STATE = os.path.expanduser("~/.local/state/omarchy/current")
+OMARCHY_THEME = os.path.join(OMARCHY_STATE, "theme", "colors.toml")
+OMARCHY_THEME_NAME = os.path.join(OMARCHY_STATE, "theme.name")
+
+# Icons come from Nerd Fonts (Omarchy ships one). Without one, shtop falls back
+# to plain symbols that every monospace font has; see use_icons().
+NERD = {
+    "LOGO": "\uf303", "CPU": "\uf4bc", "MEM": "\U000f035b", "NET": "\U000f059f",
+    "DISK": "\U000f02ca", "TEMP": "\U000f050f", "APPS": "\U000f0279", "BOLT": "\uf0e7",
+    "CHARGING": "\U000f0084", "FREQ": "\uf0e4", "CLOCK": "\uf017", "WIFI": "\uf1eb",
+    "GPU": "\uf2db", "FAN": "\U000f0210", "SEARCH": "\uf002", "WARN": "\uf071",
+    "INFO": "\uf05a", "KERNEL": "\uf17c",
+}
+PLAIN = {
+    "LOGO": "◆", "CPU": "▣", "MEM": "▤", "NET": "⇅", "DISK": "▥", "TEMP": "°", "APPS": "≡",
+    "BOLT": "↯", "CHARGING": "+", "FREQ": "~", "CLOCK": "◷", "WIFI": "≈", "GPU": "▩",
+    "FAN": "∗", "SEARCH": "/", "WARN": "!", "INFO": "i", "KERNEL": "·",
+}
+NERD_BATTERY = ["\U000f008e", "\U000f007a", "\U000f007b", "\U000f007c", "\U000f007d",
+                "\U000f007e", "\U000f007f", "\U000f0080", "\U000f0081", "\U000f0082", "\U000f0079"]
+PLAIN_BATTERY = ["▁", "▁", "▂", "▃", "▄", "▄", "▅", "▆", "▇", "█", "█"]
+
+ICON = dict(NERD)  # the active icon set
+BAT_ICONS = NERD_BATTERY
+CAP_L, CAP_R = "\ue0b6", "\ue0b4"
+ICONS_ON = True
+
+
+def use_icons(on):
+    global BAT_ICONS, CAP_L, CAP_R, ICONS_ON
+    ICON.clear()
+    ICON.update(NERD if on else PLAIN)
+    BAT_ICONS = NERD_BATTERY if on else PLAIN_BATTERY
+    CAP_L, CAP_R = ("\ue0b6", "\ue0b4") if on else ("▐", "▌")
+    ICONS_ON = on
+    _icon_cache.clear()
+
+
+def nerd_font_installed():
+    """True when fontconfig knows a font with Nerd Font glyphs (terminals fall back to it)."""
+    try:
+        out = subprocess.run(["fc-list", ":charset=f4bc", "family"],
+                             capture_output=True, text=True, timeout=3).stdout
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return bool(out.strip())
+
+# (names, icon, theme colour). Short names must match exactly; longer ones may prefix.
+APP_ICONS = [
+    (("firefox", "librewolf", "zen", "floorp"), "\uf269", "orange"),
+    (("chromium", "chrome", "brave", "vivaldi", "google-chrome"), "\uf268", "blue"),
+    (("foot", "alacritty", "kitty", "ghostty", "wezterm", "xdg-terminal-exec"), "\uf120", "green"),
+    (("bash", "zsh", "fish", "sh", "dash", "tmux", "zellij"), "\uf120", "dim"),
+    (("python", "python3", "pip", "uv"), "\ue73c", "yellow"),
+    (("node", "bun", "deno", "npm"), "\ue718", "green"),
+    (("docker", "dockerd", "containerd", "podman"), "\uf308", "blue"),
+    (("spotify", "spotify-launcher"), "\uf1bc", "green"),
+    (("discord", "vesktop", "webcord"), "\U000f066f", "blue"),
+    (("code", "codium", "cursor", "code-oss"), "\U000f0a1e", "blue"),
+    (("git", "lazygit"), "\uf1d3", "orange"),
+    (("nvim", "vim", "helix", "hx"), "\ue62b", "green"),
+    (("hyprland", "hypridle", "hyprlock", "hyprsunset", "hyprpaper", "swaybg", "start-hyprland"), "\uf359", "cyan"),
+    (("systemd", "systemd-journald", "systemd-logind", "systemd-udevd", "systemd-resolved",
+      "systemd-timesyncd", "systemd-userdbd", "dbus-daemon", "dbus-broker", "dbus-broker-launch"), "\uf013", "dim"),
+    (("steam", "steamwebhelper"), "\uf1b6", "blue"),
+    (("slack",), "\uf198", "magenta"),
+    (("telegram-desktop", "telegram"), "\uf2c6", "cyan"),
+    (("cargo", "rustc", "rust-analyzer"), "\ue7a8", "orange"),
+    (("go", "gopls"), "\ue627", "cyan"),
+    (("java",), "\ue738", "red"),
+    (("pipewire", "pipewire-pulse", "wireplumber", "pulseaudio"), "\uf028", "magenta"),
+    (("networkmanager", "iwd", "wpa_supplicant", "dhcpcd"), "\uf1eb", "cyan"),
+    (("bluetoothd",), "\uf293", "blue"),
+    (("xorg", "xwayland"), "\uf108", "dim"),
+    (("sshd", "ssh", "ssh-agent", "gpg-agent"), "\uf084", "yellow"),
+    (("mpv", "vlc", "obs"), "\uf03d", "magenta"),
+    (("quickshell", "omarchy", "walker", "elephant"), "\uf303", "accent"),
+    (("postgres", "mysqld", "mariadbd", "redis-server"), "\uf1c0", "blue"),
+    (("claude", "codex"), "\uf0e7", "orange"),
+    (("shtop", "btop", "htop", "top"), "\uf201", "accent"),
+    (("nautilus", "thunar"), "\uf07b", "yellow"),
+]
+
+BLOCKS = " ▁▂▃▄▅▆▇█"
+BAR = "━"
+KEEP = object()  # "leave the existing background alone"
+
+
+# ───────────────────────────── colours ──────────────────────────────
+
+FALLBACK = {
+    "accent": "#7aa2f7", "selection": "#292e42", "muted": "#414868",
+    "background": "#1a1b26", "lighter_background": "#24283b",
+    "foreground": "#a9b1d6", "dark_foreground": "#565f89", "bright_foreground": "#c0caf5",
+    "red": "#f7768e", "yellow": "#e0af68", "green": "#9ece6a",
+    "cyan": "#449dab", "blue": "#7aa2f7", "magenta": "#ad8ee6",
+}
+
+
+def hex2rgb(s):
+    s = s.strip().lstrip("#")
+    if len(s) == 3:
+        s = "".join(c * 2 for c in s)
+    return (int(s[0:2], 16), int(s[2:4], 16), int(s[4:6], 16))
+
+
+def mix(a, b, t):
+    t = 0.0 if t < 0 else 1.0 if t > 1 else round(t, 3)
+    key = (a, b, t)
+    c = _mix_cache.get(key)
+    if c is None:
+        if len(_mix_cache) > 50000:
+            _mix_cache.clear()
+        c = _mix_cache[key] = _mix(a, b, t)
+    return c
+
+
+_mix_cache = {}
+
+
+def _mix(a, b, t):
+    return (round(a[0] + (b[0] - a[0]) * t),
+            round(a[1] + (b[1] - a[1]) * t),
+            round(a[2] + (b[2] - a[2]) * t))
+
+
+def ramp(stops, t):
+    t = max(0.0, min(1.0, t))
+    n = len(stops) - 1
+    i = min(int(t * n), n - 1)
+    return mix(stops[i], stops[i + 1], t * n - i)
+
+
+def theme_file():
+    """The colors.toml to use and what kind of source it is, or (None, None)."""
+    for path, kind in ((os.environ.get("SHTOP_THEME"), "custom"),
+                       (USER_THEME, "custom"),
+                       (OMARCHY_THEME, "omarchy")):
+        if path and os.path.isfile(path):
+            return path, kind
+    return None, None
+
+
+def luminance(rgb):
+    return (0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]) / 255
+
+
+OSC_COLOR = re.compile(r"\x1b\](10|11|4;(\d+));rgb:([0-9a-fA-F]+)/([0-9a-fA-F]+)/([0-9a-fA-F]+)")
+DA1_REPLY = re.compile(r"\x1b\[\?[\d;]*c")
+
+
+def parse_palette(reply):
+    """Turn a terminal's OSC 4/10/11 replies into colors.toml-style entries."""
+    found = {}
+    for m in OSC_COLOR.finditer(reply):
+        chans = []
+        for part in m.group(3, 4, 5):
+            chans.append(round(int(part, 16) * 255 / ((1 << (4 * len(part))) - 1)))
+        key = {"10": "fg", "11": "bg"}.get(m.group(1))
+        found[key if key else int(m.group(2))] = tuple(chans)
+    if "fg" not in found or "bg" not in found:
+        return None
+    fg, bg = found["fg"], found["bg"]
+    dark = luminance(bg) < 0.5
+    base = {k: hex2rgb(v) for k, v in FALLBACK.items()}
+
+    def pick(i, name):
+        c = found.get(i)
+        # ignore palette entries that would be unreadable on this background
+        if c is None or abs(luminance(c) - luminance(bg)) < 0.12:
+            return base[name]
+        return c
+
+    muted = found.get(8)
+    if muted is None or abs(luminance(muted) - luminance(bg)) < 0.1:
+        muted = _mix(fg, bg, 0.62)
+    colors = {
+        "background": bg, "foreground": fg,
+        "red": pick(1, "red"), "green": pick(2, "green"), "yellow": pick(3, "yellow"),
+        "blue": pick(4, "blue"), "magenta": pick(5, "magenta"), "cyan": pick(6, "cyan"),
+        "muted": muted,
+        "dark_foreground": _mix(fg, bg, 0.42),
+        "bright_foreground": _mix(fg, (255, 255, 255) if dark else (0, 0, 0), 0.3),
+        "selection": _mix(bg, fg, 0.14),
+        "lighter_background": _mix(bg, fg, 0.07),
+    }
+    colors["accent"] = colors["blue"]
+    out = {k: "#{:02x}{:02x}{:02x}".format(*v) for k, v in colors.items()}
+    out["mode"] = "dark" if dark else "light"
+    return out
+
+
+def query_terminal_palette(fd_in, fd_out, timeout=0.3):
+    """Ask the terminal for its colours (needs raw mode). Returns parse_palette() or None.
+
+    Ends with a Primary Device Attributes request, which every terminal answers,
+    so we know when the replies are complete without waiting for the timeout."""
+    query = "\x1b]10;?\x1b\\\x1b]11;?\x1b\\" + "".join(f"\x1b]4;{i};?\x1b\\" for i in range(16)) + "\x1b[c"
+    try:
+        os.write(fd_out, query.encode())
+    except OSError:
+        return None
+    reply, end = "", time.monotonic() + timeout
+    while time.monotonic() < end:
+        ready, _, _ = select.select([fd_in], [], [], max(0.0, end - time.monotonic()))
+        if not ready:
+            break
+        reply += os.read(fd_in, 4096).decode(errors="ignore")
+        if DA1_REPLY.search(reply):
+            break
+    return parse_palette(reply)
+
+
+class Theme:
+    def __init__(self, terminal_palette=None):
+        self.terminal = terminal_palette
+        self.stamp = None
+        self.load()
+
+    def _stamp(self):
+        path, _ = theme_file()
+        if path is None:
+            # Omarchy swaps theme directories with rm + mv; don't fall back to the
+            # terminal palette during that instant.
+            if self.kind == "omarchy" and os.path.isdir(OMARCHY_STATE):
+                return self.stamp
+            return None
+        try:
+            st = os.stat(path)
+            return (path, st.st_ino, st.st_mtime_ns, st.st_size)
+        except OSError:
+            return None
+
+    def changed(self):
+        return self._stamp() != self.stamp
+
+    def load(self):
+        path, kind = theme_file()
+        data = {}
+        if path:
+            try:
+                with open(path, "rb") as f:
+                    data = tomllib.load(f)
+            except (OSError, tomllib.TOMLDecodeError):
+                data = {}
+        elif self.terminal:
+            data, kind = self.terminal, "terminal"
+        self.kind = kind or "default"
+        self.mode = data.get("mode", "dark")
+        raw = {k: v for k, v in data.items() if isinstance(v, str) and v.startswith("#")}
+        c = {}
+        for k, v in {**FALLBACK, **raw}.items():
+            try:
+                c[k] = hex2rgb(v)
+            except ValueError:
+                c[k] = hex2rgb(FALLBACK[k]) if k in FALLBACK else None
+        self.fg = c["foreground"]
+        self.dim = c["dark_foreground"]
+        self.bright = c["bright_foreground"]
+        self.muted = c["muted"]
+        self.sel = c["selection"]
+        self.accent = c["accent"]
+        self.bg = c["background"]
+        self.red, self.yellow, self.green = c["red"], c["yellow"], c["green"]
+        self.cyan, self.blue, self.magenta = c["cyan"], c["blue"], c["magenta"]
+        self.orange = c.get("orange") or mix(self.red, self.yellow, 0.5)
+        # The empty part of a meter: a touch stronger than the selection colour so
+        # it stays visible on the selected row too.
+        self.track = mix(self.sel, self.muted, 0.35)
+        self.name = {"custom": "custom colors", "terminal": "terminal colors",
+                     "default": "default colors"}.get(self.kind, "")
+        if self.kind == "omarchy":
+            name = read(OMARCHY_THEME_NAME, "") or ""
+            self.name = name.replace("-", " ").title() or "Omarchy"
+        self.stamp = None
+        self.stamp = self._stamp()
+
+    def sev(self, f):
+        """green → yellow → red as f goes 0 → 1 (stays green below half)."""
+        if f < 0.5:
+            return self.green
+        if f < 0.8:
+            return mix(self.green, self.yellow, (f - 0.5) / 0.3)
+        return mix(self.yellow, self.red, (f - 0.8) / 0.2)
+
+    def fade(self, c, t=0.55):
+        """c pushed towards the background — for the low end of gradients."""
+        return mix(c, self.bg, t)
+
+    def temp(self, c):
+        return self.sev((c - 35) / 60)
+
+
+# ───────────────────────────── formatting ───────────────────────────
+
+def fmt_bytes(n):
+    n = float(n)
+    for unit in ("B", "KB", "MB", "GB", "TB", "PB"):
+        if abs(n) < 1024 or unit == "PB":
+            if unit == "B":
+                return f"{int(n)} B"
+            return f"{n:.1f} {unit}" if n < 100 else f"{n:.0f} {unit}"
+        n /= 1024
+
+
+def fmt_rate(n):
+    return fmt_bytes(n) + "/s"
+
+
+def fmt_dur(s):
+    s = int(max(0, s))
+    d, s = divmod(s, 86400)
+    h, s = divmod(s, 3600)
+    m, s = divmod(s, 60)
+    if d:
+        return f"{d}d {h}h"
+    if h:
+        return f"{h}h {m}m"
+    if m:
+        return f"{m}m"
+    return f"{s}s"
+
+
+def trunc(s, n):
+    if n <= 0:
+        return ""
+    return s if len(s) <= n else s[: n - 1] + "…"
+
+
+def read(path, default=None):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return default
+
+
+def read_int(path, default=None):
+    v = read(path)
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return default
+
+
+# ───────────────────────────── screen ───────────────────────────────
+
+class Screen:
+    """A cell buffer that only re-emits rows that changed since the last frame."""
+
+    def __init__(self, w=80, h=24):
+        self.resize(w, h)
+
+    def resize(self, w, h):
+        self.w, self.h = w, h
+        self.prev = None
+        self.clear()
+
+    def clear(self):
+        w, h = self.w, self.h
+        self.ch = [[" "] * w for _ in range(h)]
+        self.fg = [[None] * w for _ in range(h)]
+        self.bg = [[None] * w for _ in range(h)]
+        self.bd = [[False] * w for _ in range(h)]
+
+    def put(self, x, y, s, fg=None, bg=KEEP, bold=False):
+        if y < 0 or y >= self.h:
+            return
+        ch, fgr, bgr, bdr = self.ch[y], self.fg[y], self.bg[y], self.bd[y]
+        for i, c in enumerate(s):
+            xx = x + i
+            if 0 <= xx < self.w:
+                ch[xx] = c
+                fgr[xx] = fg
+                bdr[xx] = bold
+                if bg is not KEEP:
+                    bgr[xx] = bg
+
+    def put_soft(self, x, y, s, fg=None):
+        """Write only over empty cells (labels that must not hide graph bars)."""
+        if 0 <= y < self.h:
+            for i, c in enumerate(s):
+                xx = x + i
+                if 0 <= xx < self.w and self.ch[y][xx] in " ┈":
+                    self.ch[y][xx], self.fg[y][xx], self.bd[y][xx] = c, fg, False
+
+    def fill(self, x, y, w, h, bg):
+        for yy in range(max(0, y), min(self.h, y + h)):
+            for xx in range(max(0, x), min(self.w, x + w)):
+                self.ch[yy][xx] = " "
+                self.bg[yy][xx] = bg
+                self.fg[yy][xx] = None
+
+    @staticmethod
+    def _sgr(fg, bg, bold):
+        p = ["0"]
+        if bold:
+            p.append("1")
+        p.append("38;2;{};{};{}".format(*fg) if fg else "39")
+        p.append("48;2;{};{};{}".format(*bg) if bg else "49")
+        return "\x1b[" + ";".join(p) + "m"
+
+    def _row(self, y):
+        out, cur = [], None
+        for c, f, b, d in zip(self.ch[y], self.fg[y], self.bg[y], self.bd[y], strict=True):
+            st = (f, b, d)
+            if st != cur:
+                out.append(self._sgr(f, b, d))
+                cur = st
+            out.append(c)
+        return "".join(out)
+
+    def flush(self):
+        rows = [tuple(zip(self.ch[y], self.fg[y], self.bg[y], self.bd[y], strict=True)) for y in range(self.h)]
+        buf = ["\x1b[?2026h"]
+        for y in range(self.h):
+            if self.prev is not None and self.prev[y] == rows[y]:
+                continue
+            buf.append(f"\x1b[{y + 1};1H")
+            buf.append(self._row(y))
+        buf.append("\x1b[0m\x1b[?2026l")
+        self.prev = rows
+        data = "".join(buf).encode()
+        while data:
+            n = os.write(sys.stdout.fileno(), data)
+            data = data[n:]
+
+    def dump(self):
+        return "\n".join(self._row(y) + "\x1b[0m" for y in range(self.h)) + "\n"
+
+
+# ───────────────────────────── collectors ───────────────────────────
+
+class CPU:
+    def __init__(self):
+        self.threads = os.cpu_count() or 1
+        self.model, self.cores = self._info()
+        self.prev = None
+        self.total = 0.0
+        self.per = [0.0] * self.threads
+        self.hist = deque(maxlen=1000)
+        self.freq = None
+        self.load = (0.0, 0.0, 0.0)
+        self.running = 0
+
+    def _info(self):
+        txt = read("/proc/cpuinfo", "")
+        m = re.search(r"^model name\s*:\s*(.+)$", txt, re.M)
+        model = m.group(1) if m else "Processor"
+        for pat in (r"\(R\)", r"\(TM\)", r"@.*$", r"\b\d+(st|nd|rd|th) Gen\b", r"\bCPU\b",
+                    r"\bProcessor\b", r"\bwith Radeon.*$", r"\b\d+-Core\b", r"\s+Graphics$"):
+            model = re.sub(pat, "", model, flags=re.I)
+        model = re.sub(r"\s+", " ", model).strip()
+        cores = {}
+        for phys, cc in re.findall(r"physical id\s*:\s*(\d+).*?cpu cores\s*:\s*(\d+)", txt, re.S):
+            cores[phys] = int(cc)
+        return model, (sum(cores.values()) or self.threads)
+
+    def _read(self):
+        out = []
+        with open("/proc/stat") as f:
+            for line in f:
+                if line.startswith("cpu"):
+                    v = [int(x) for x in line.split()[1:9]]
+                    out.append((sum(v), v[3] + v[4]))
+                elif line.startswith("procs_running"):
+                    self.running = int(line.split()[1])
+        return out
+
+    def update(self):
+        cur = self._read()
+        if self.prev and len(self.prev) == len(cur):
+            pct = []
+            for (t, i), (pt, pi) in zip(cur, self.prev, strict=True):
+                dt = t - pt
+                pct.append(0.0 if dt <= 0 else max(0.0, min(1.0, 1 - (i - pi) / dt)))
+            self.total, self.per = pct[0], pct[1:]
+            self.hist.append(self.total)
+        self.prev = cur
+        self.load = os.getloadavg()
+        self.freq = self._freq()
+
+    def _freq(self):
+        vals = []
+        for i in range(self.threads):
+            v = read_int(f"/sys/devices/system/cpu/cpu{i}/cpufreq/scaling_cur_freq")
+            if v is None:
+                break
+            vals.append(v / 1e6)
+        if vals:
+            return sum(vals) / len(vals)
+        mhz = re.findall(r"^cpu MHz\s*:\s*([\d.]+)", read("/proc/cpuinfo", ""), re.M)
+        return sum(map(float, mhz)) / len(mhz) / 1000 if mhz else None
+
+
+class Memory:
+    def __init__(self):
+        self.hist = deque(maxlen=1000)
+        self.total = self.used = self.cache = self.free = self.avail = 1
+        self.swap_total = self.swap_used = 0
+        self.zram = "zram" in read("/proc/swaps", "")
+
+    def update(self):
+        m = {}
+        with open("/proc/meminfo") as f:
+            for line in f:
+                k, v = line.split(":", 1)
+                m[k] = int(v.split()[0]) * 1024
+        self.total = m["MemTotal"]
+        self.free = m["MemFree"]
+        self.avail = m.get("MemAvailable", self.free)
+        self.used = self.total - self.avail
+        self.cache = max(0, self.avail - self.free)
+        self.swap_total = m.get("SwapTotal", 0)
+        self.swap_used = self.swap_total - m.get("SwapFree", 0)
+        self.hist.append(self.used / self.total)
+
+
+class Network:
+    VIRTUAL = ("lo", "veth", "docker", "br-", "virbr", "tun", "tap", "wg", "tailscale", "vnet")
+
+    def __init__(self):
+        self.prev = None
+        self.down = self.up = 0.0
+        self.rx_total = self.tx_total = 0
+        self.dh, self.uh = deque(maxlen=1000), deque(maxlen=1000)
+        self.iface, self.ip, self.signal = None, None, None
+        self._ip_at = 0
+
+    def _default_iface(self):
+        try:
+            with open("/proc/net/route") as f:
+                for line in f.readlines()[1:]:
+                    p = line.split()
+                    if p[1] == "00000000" and int(p[3], 16) & 2:
+                        return p[0]
+        except OSError:
+            pass
+        return None
+
+    def update(self, now):
+        stats = {}
+        with open("/proc/net/dev") as f:
+            for line in f.readlines()[2:]:
+                name, rest = line.split(":", 1)
+                v = rest.split()
+                stats[name.strip()] = (int(v[0]), int(v[8]))
+        iface = self._default_iface()
+        names = [iface] if iface in stats else [n for n in stats if not n.startswith(self.VIRTUAL)]
+        rx = sum(stats[n][0] for n in names)
+        tx = sum(stats[n][1] for n in names)
+        if self.prev and self.prev[0] == names and now > self.prev[3]:
+            dt = now - self.prev[3]
+            self.down = max(0.0, (rx - self.prev[1]) / dt)
+            self.up = max(0.0, (tx - self.prev[2]) / dt)
+            self.dh.append(self.down)
+            self.uh.append(self.up)
+        self.prev = (names, rx, tx, now)
+        self.rx_total, self.tx_total = rx, tx
+        self.iface = iface
+        self.signal = None
+        if iface:
+            for line in (read("/proc/net/wireless", "") or "").splitlines()[2:]:
+                if line.strip().startswith(iface + ":"):
+                    try:
+                        self.signal = min(100, int(float(line.split()[2].rstrip(".")) / 70 * 100))
+                    except (ValueError, IndexError):
+                        pass
+        if now - self._ip_at > 10:
+            self._ip_at = now
+            self.ip = None
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                s.connect(("1.1.1.1", 53))  # UDP connect: picks a route, sends nothing
+                self.ip = s.getsockname()[0]
+                s.close()
+            except OSError:
+                pass
+
+
+class Disks:
+    REAL_FS = {"ext2", "ext3", "ext4", "btrfs", "xfs", "vfat", "exfat", "ntfs", "ntfs3", "f2fs",
+               "zfs", "bcachefs", "jfs", "fuseblk", "9p", "virtiofs", "nfs", "nfs4", "cifs", "smb3"}
+    SKIP = ("/snap", "/var/lib/docker", "/run", "/proc", "/sys", "/var/lib/containers")
+
+    def __init__(self):
+        self.mounts = []
+        self.read_rate = self.write_rate = 0.0
+        self.prev = None
+
+    def update(self, now):
+        mounts, seen = [], set()
+        with open("/proc/mounts") as f:
+            for line in f:
+                dev, mnt, fs = line.split()[:3]
+                mnt = mnt.replace("\\040", " ")
+                if fs not in self.REAL_FS or mnt.startswith(self.SKIP) or dev in seen:
+                    continue
+                seen.add(dev)
+                try:
+                    st = os.statvfs(mnt)
+                except OSError:
+                    continue
+                if not st.f_blocks:
+                    continue
+                total = st.f_blocks * st.f_frsize
+                avail = st.f_bavail * st.f_frsize
+                used = total - st.f_bfree * st.f_frsize
+                mounts.append({"mnt": mnt, "fs": fs, "total": total, "used": used, "free": avail,
+                               "frac": used / (used + avail) if used + avail else 0.0})
+        mounts.sort(key=lambda m: (m["mnt"] != "/", m["mnt"] != "/home", m["mnt"]))
+        self.mounts = mounts
+
+        try:
+            phys = {d for d in os.listdir("/sys/block")
+                    if not d.startswith(("loop", "ram", "zram", "dm-", "sr", "fd", "md"))}
+            rd = wr = 0
+            with open("/proc/diskstats") as f:
+                for line in f:
+                    p = line.split()
+                    if p[2] in phys:
+                        rd += int(p[5]) * 512
+                        wr += int(p[9]) * 512
+            if self.prev and now > self.prev[2]:
+                dt = now - self.prev[2]
+                self.read_rate = max(0.0, (rd - self.prev[0]) / dt)
+                self.write_rate = max(0.0, (wr - self.prev[1]) / dt)
+            self.prev = (rd, wr, now)
+        except OSError:
+            pass
+
+    @staticmethod
+    def label(mnt):
+        return {"/": "System", "/home": "Home", "/boot": "Boot", "/efi": "EFI",
+                "/boot/efi": "EFI"}.get(mnt, os.path.basename(mnt.rstrip("/")) or mnt)
+
+
+class Sensors:
+    GROUPS = {"coretemp": "CPU", "k10temp": "CPU", "zenpower": "CPU", "cpu_thermal": "CPU",
+              "amdgpu": "GPU", "nouveau": "GPU", "radeon": "GPU", "nvme": "SSD", "drivetemp": "Disk",
+              "acpitz": "Board", "iwlwifi_1": "Wi-Fi", "thinkpad": "Laptop", "spd5118": "RAM"}
+
+    def __init__(self):
+        self.temps = []   # [(label, celsius)]
+        self.fans = []    # [(label, rpm)]
+        self.cpu_temp = None
+
+    def update(self):
+        groups, fans = {}, []
+        for h in sorted(glob.glob("/sys/class/hwmon/hwmon*")):
+            name = read(h + "/name", "")
+            label = self.GROUPS.get(name)
+            if label is None and name.startswith("iwlwifi"):
+                label = "Wi-Fi"
+            for t in glob.glob(h + "/temp*_input"):
+                v = read_int(t)
+                if v is None or v <= 0:
+                    continue
+                c = v / 1000
+                sub = read(t[:-6] + "_label", "") or ""
+                if label == "CPU" and sub and not sub.startswith(("Package", "Tctl", "Tdie")):
+                    groups["_cores"] = max(groups.get("_cores", 0), c)
+                    continue
+                key = label or name.replace("_", " ").title()
+                groups[key] = max(groups.get(key, 0), c)
+            for fpath in glob.glob(h + "/fan*_input"):
+                rpm = read_int(fpath)
+                if rpm:
+                    fans.append((read(fpath[:-6] + "_label", "") or "Fan", rpm))
+        if "CPU" not in groups and "_cores" in groups:
+            groups["CPU"] = groups["_cores"]
+        groups.pop("_cores", None)
+        if "CPU" not in groups:
+            for z in glob.glob("/sys/class/thermal/thermal_zone*"):
+                if read(z + "/type") in ("x86_pkg_temp", "cpu-thermal", "soc_thermal"):
+                    v = read_int(z + "/temp")
+                    if v:
+                        groups["CPU"] = v / 1000
+        order = ["CPU", "GPU", "SSD", "Disk", "RAM", "Board", "Wi-Fi", "Laptop"]
+        self.temps = sorted(groups.items(), key=lambda kv: order.index(kv[0]) if kv[0] in order else 99)
+        self.fans = fans
+        self.cpu_temp = groups.get("CPU")
+
+
+class Battery:
+    def __init__(self):
+        self.present = False
+
+    def update(self):
+        bats = sorted(glob.glob("/sys/class/power_supply/BAT*"))
+        self.present = bool(bats)
+        if not bats:
+            return
+        b = bats[0]
+        self.pct = read_int(b + "/capacity", 0)
+        self.status = read(b + "/status", "Unknown")
+        now = read_int(b + "/energy_now") or read_int(b + "/charge_now")
+        full = read_int(b + "/energy_full") or read_int(b + "/charge_full")
+        rate = read_int(b + "/power_now") or read_int(b + "/current_now")
+        volts = read_int(b + "/voltage_now")
+        self.watts = None
+        if rate:
+            self.watts = rate / 1e6 if read_int(b + "/power_now") else rate * (volts or 0) / 1e12
+        self.time_left = None
+        if rate and now and full:
+            if self.status == "Discharging":
+                self.time_left = now / rate * 3600
+            elif self.status == "Charging":
+                self.time_left = max(0, full - now) / rate * 3600
+        self.plugged = any(read(p + "/online") == "1"
+                           for p in glob.glob("/sys/class/power_supply/*")
+                           if read(p + "/type") == "Mains")
+
+    def icon(self):
+        if self.status == "Charging":
+            return ICON["CHARGING"]
+        return BAT_ICONS[min(10, max(0, round(self.pct / 10)))]
+
+    def describe(self):
+        if self.status == "Charging":
+            s = "Charging"
+            if self.time_left:
+                s += f" · full in {fmt_dur(self.time_left)}"
+        elif self.status == "Discharging":
+            s = "On battery"
+            if self.time_left:
+                s += f" · {fmt_dur(self.time_left)} left"
+        elif self.status == "Full" or self.pct >= 99:
+            s = "Plugged in · full"
+        elif self.plugged:
+            s = "Plugged in · not charging"
+        else:
+            s = self.status
+        if self.watts and self.watts > 0.1:
+            s += f" · {self.watts:.1f} W"
+        return s
+
+
+class GPU:
+    def __init__(self):
+        self.items = []  # [(name, busy_frac, vram_used, vram_total, temp)]
+        self.nvidia = shutil.which("nvidia-smi")
+        self._at = 0
+
+    def update(self, now):
+        items = []
+        for dev in sorted(glob.glob("/sys/class/drm/card[0-9]/device")):
+            busy = read_int(dev + "/gpu_busy_percent")
+            if busy is None:
+                continue
+            items.append(("GPU", busy / 100, read_int(dev + "/mem_info_vram_used"),
+                          read_int(dev + "/mem_info_vram_total"), None))
+        if self.nvidia:
+            if now - self._at >= 2:
+                self._at = now
+                try:
+                    out = subprocess.run(
+                        [self.nvidia, "--query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu",
+                         "--format=csv,noheader,nounits"], capture_output=True, text=True, timeout=1).stdout
+                    self._nv = []
+                    for line in out.strip().splitlines():
+                        u, mu, mt, t = [x.strip() for x in line.split(",")]
+                        self._nv.append(("GPU", int(u) / 100, int(mu) << 20, int(mt) << 20, int(t)))
+                except (OSError, ValueError, subprocess.SubprocessError):
+                    self._nv = []
+            items += getattr(self, "_nv", [])
+        self.items = items
+
+
+class Proc:
+    __slots__ = ("pid", "ppid", "name", "cmd", "uid", "user", "state", "cpu", "mem",
+                 "threads", "start", "kernel", "procs", "count", "key")
+
+
+INTERPRETERS = {"python", "python2", "python3", "node", "bash", "sh", "zsh", "fish", "perl",
+                "ruby", "lua", "luajit", "bun", "deno", "java", "uv", "uvx"}
+
+STATES = {"R": "running", "S": "sleeping", "D": "waiting", "Z": "zombie", "T": "stopped",
+          "t": "traced", "I": "idle", "X": "dead", "P": "parked"}
+STATE_HELP = {"R": "actively using the CPU right now",
+              "S": "waiting for something to do (normal)",
+              "D": "waiting on disk or hardware — can't be interrupted",
+              "Z": "finished, but its parent hasn't collected it yet",
+              "T": "paused (e.g. with Ctrl+Z)",
+              "I": "idle kernel task"}
+
+
+class Procs:
+    def __init__(self, ncpu):
+        self.clk = os.sysconf("SC_CLK_TCK")
+        self.page = os.sysconf("SC_PAGE_SIZE")
+        self.ncpu = ncpu
+        self.prev, self.prev_t = {}, None
+        self.meta = {}
+        self.users = {}
+        self.list = []
+        m = re.search(r"^btime (\d+)", read("/proc/stat", ""), re.M)
+        self.btime = int(m.group(1)) if m else time.time()
+
+    def user(self, uid):
+        if uid not in self.users:
+            try:
+                self.users[uid] = pwd.getpwuid(uid).pw_name
+            except KeyError:
+                self.users[uid] = str(uid)
+        return self.users[uid]
+
+    @staticmethod
+    def _name(comm, argv):
+        if not argv or not argv[0]:
+            return comm
+        a0 = argv[0]
+        if len(argv) == 1 and " " in a0 and not os.path.exists(a0):
+            a0 = a0.split(" ")[0]
+        base = os.path.basename(a0).lstrip("-").rstrip(":") or comm
+        stem = re.sub(r"[\d.]+$", "", base)
+        if base in INTERPRETERS or stem in INTERPRETERS:
+            it = iter(argv[1:])
+            for a in it:
+                if a == "-m":
+                    return next(it, base)
+                if a == "-c":
+                    return base
+                if not a.startswith("-"):
+                    return os.path.basename(a.rstrip("/")) or base
+            return base
+        return base
+
+    def update(self, now):
+        dt = now - self.prev_t if self.prev_t else None
+        cur, out, meta = {}, [], {}
+        for d in os.listdir("/proc"):
+            if not d.isdigit():
+                continue
+            try:
+                with open(f"/proc/{d}/stat", "rb") as f:
+                    raw = f.read().decode(errors="replace")
+            except OSError:
+                continue
+            lp, rp = raw.find("("), raw.rfind(")")
+            comm, v = raw[lp + 1:rp], raw[rp + 2:].split()
+            pid, ppid = int(d), int(v[1])
+            ticks, start = int(v[11]) + int(v[12]), int(v[19])
+            key = (pid, start)
+            m = self.meta.get(key)
+            if m is None or m[4] != comm:
+                kernel = ppid == 2 or pid == 2
+                argv = []
+                if not kernel:
+                    try:
+                        with open(f"/proc/{d}/cmdline", "rb") as f:
+                            argv = [a.decode(errors="replace") for a in f.read().split(b"\0") if a]
+                    except OSError:
+                        pass
+                try:
+                    uid = os.stat(f"/proc/{d}").st_uid
+                except OSError:
+                    uid = -1
+                m = (self._name(comm, argv), " ".join(argv) or f"[{comm}]", uid, kernel, comm)
+            meta[key] = m
+            cur[key] = ticks
+            p = Proc()
+            p.pid, p.ppid, p.start = pid, ppid, start
+            p.name, p.cmd, p.uid, p.kernel = m[0], m[1], m[2], m[3]
+            p.user = self.user(p.uid)
+            p.state = v[0]
+            p.threads = int(v[17])
+            p.mem = int(v[21]) * self.page
+            p.cpu = 0.0
+            if dt and key in self.prev:
+                p.cpu = max(0.0, (ticks - self.prev[key]) / self.clk / dt / self.ncpu)
+            p.procs, p.count, p.key = [p], 1, pid
+            out.append(p)
+        self.meta, self.prev, self.prev_t, self.list = meta, cur, now, out
+
+
+def group(procs):
+    groups = {}
+    for p in procs:
+        groups.setdefault(p.name, []).append(p)
+    out = []
+    order = {"R": 0, "D": 1, "S": 2, "I": 3, "T": 4, "Z": 5}
+    for name, members in groups.items():
+        members.sort(key=lambda p: p.pid)
+        g = Proc()
+        g.name, g.key, g.procs, g.count = name, name, members, len(members)
+        g.pid, g.ppid, g.start = members[0].pid, members[0].ppid, members[0].start
+        g.cmd, g.kernel = members[0].cmd, members[0].kernel
+        g.cpu = sum(p.cpu for p in members)
+        g.mem = sum(p.mem for p in members)
+        g.threads = sum(p.threads for p in members)
+        users = {p.user for p in members}
+        g.user = users.pop() if len(users) == 1 else "several"
+        g.uid = members[0].uid
+        g.state = min((p.state for p in members), key=lambda s: order.get(s, 9))
+        out.append(g)
+    return out
+
+
+# ───────────────────────────── animation ────────────────────────────
+
+class Anim:
+    """Eases every displayed number towards its real value so nothing jumps."""
+
+    TAU = 0.07  # seconds; ~90% of the way in a quarter second
+
+    def __init__(self):
+        self.v = {}
+        self.t = time.monotonic()
+        self.k = 1.0
+        self.active = False
+        self.enabled = True
+
+    def step(self):
+        now = time.monotonic()
+        dt, self.t = now - self.t, now
+        self.k = 1.0 if not self.enabled else 1 - math.exp(-max(0.0, dt) / self.TAU)
+        self.active = False
+
+    def __call__(self, key, target):
+        d = self.v.get(key)
+        if d is None or self.k >= 1.0:
+            self.v[key] = target
+            return target
+        d += (target - d) * self.k
+        if abs(target - d) <= abs(target) * 0.01 + 1e-3:
+            d = target
+        else:
+            self.active = True
+        self.v[key] = d
+        return d
+
+
+# ───────────────────────────── the app ──────────────────────────────
+
+SORTS = ["cpu", "mem", "name", "count", "pid"]
+SORT_NAMES = {"cpu": "CPU", "mem": "Memory", "name": "Name", "count": "Procs", "pid": "PID"}
+
+
+_icon_cache = {}
+
+
+def app_icon(name, kernel, T):
+    key = (name, kernel, id(T), T.stamp)
+    hit = _icon_cache.get(key)
+    if hit is None:
+        if len(_icon_cache) > 4000:
+            _icon_cache.clear()
+        hit = _icon_cache[key] = _app_icon(name, kernel, T)
+    return hit
+
+
+def _app_icon(name, kernel, T):
+    if kernel:
+        return ICON["KERNEL"], T.muted
+    n = name.lower()
+    for names, icon, col in APP_ICONS:
+        for k in names:
+            if n == k or (len(k) > 4 and n.startswith(k)):
+                return (icon if ICONS_ON else "●"), getattr(T, col)
+    palette = [T.blue, T.cyan, T.green, T.yellow, T.magenta, T.orange, T.red]
+    return "●", mix(palette[zlib.crc32(n.encode()) % len(palette)], T.bg, 0.25)
+
+
+class App:
+    def __init__(self, theme=None, interval=1.0, animate=True):
+        self.theme = theme or Theme()
+        self.scr = Screen()
+        self.anim = Anim()
+        self.cpu, self.mem, self.net = CPU(), Memory(), Network()
+        self.disks, self.sens, self.bat, self.gpu = Disks(), Sensors(), Battery(), GPU()
+        self.procs = Procs(self.cpu.threads)
+        self.hostname = socket.gethostname()
+        self.interval = interval
+        self.anim.enabled = animate
+        self.grouped = True
+        self.show_kernel = False
+        self.sort, self.reverse = "cpu", False
+        self.filter, self.filtering = "", False
+        self.sel, self.sel_key, self.scroll = 0, None, 0
+        self.picked = False  # until the user picks a row, the selection stays on top
+        self.overlay = None
+        self.confirm = None
+        self.toast, self.toast_until = None, 0
+        self.rows = []
+        self.trend = {}  # row key -> deque of CPU shares, for sparklines
+        self.table = None
+        self.header_hits = []
+        self.last_click = (0, None)
+        self.running = True
+
+    # ── data ──
+    @property
+    def fast_interval(self):
+        return self.interval / 2
+
+    def sample_fast(self):
+        """CPU, memory and network: cheap, sampled twice per interval for smooth graphs."""
+        now = time.monotonic()
+        self.cpu.update()
+        self.mem.update()
+        self.net.update(now)
+        if hasattr(self, "groups"):
+            self._insight = self.insight()
+
+    def sample(self):
+        now = time.monotonic()
+        self.disks.update(now)
+        self.sens.update()
+        self.bat.update()
+        self.gpu.update(now)
+        self.procs.update(now)
+        self.groups = group([p for p in self.procs.list if not p.kernel and p.pid != os.getpid()])
+        self.record_trends()
+        self.build_rows()
+        self._insight = self.insight()
+
+    def record_trends(self):
+        live = [p for p in self.procs.list]
+        seen = set()
+        for p in live:
+            seen.add(p.pid)
+            self.trend.setdefault(p.pid, deque(maxlen=60)).append(p.cpu)
+        for g in self.groups:
+            seen.add(g.name)
+            self.trend.setdefault(g.name, deque(maxlen=60)).append(g.cpu)
+        for k in [k for k in self.trend if k not in seen]:
+            del self.trend[k]
+
+    def build_rows(self):
+        me = os.getpid()
+        procs = [p for p in self.procs.list
+                 if (self.show_kernel or not p.kernel) and p.pid != me]
+        rows = group(procs) if self.grouped else procs
+        if self.filter:
+            f = self.filter.lower()
+            rows = [r for r in rows if f in r.name.lower() or f in r.cmd.lower() or f == str(r.pid)]
+        key = {
+            "cpu": lambda r: (r.cpu, r.mem),
+            "mem": lambda r: (r.mem, r.cpu),
+            "name": lambda r: r.name.lower(),
+            "count": lambda r: (r.count, r.cpu),
+            "pid": lambda r: r.pid,
+        }[self.sort]
+        desc = self.sort in ("cpu", "mem", "count")
+        rows.sort(key=key, reverse=desc != self.reverse)
+        self.rows = rows
+        if not self.picked:
+            self.sel = 0
+        elif self.sel_key is not None:
+            for i, r in enumerate(rows):
+                if r.key == self.sel_key:
+                    self.sel = i
+                    break
+        self.sel = max(0, min(self.sel, len(rows) - 1))
+        self.sel_key = rows[self.sel].key if rows else None
+
+    def current(self):
+        return self.rows[self.sel] if self.rows and 0 <= self.sel < len(self.rows) else None
+
+    def move(self, d):
+        if not self.rows:
+            return
+        self.sel = max(0, min(len(self.rows) - 1, self.sel + d))
+        self.sel_key = self.rows[self.sel].key
+        self.picked = True
+
+    def say(self, msg, color=None, secs=4):
+        self.toast = (msg, color)
+        self.toast_until = time.monotonic() + secs
+
+    def kill(self, row, sig):
+        ok = denied = 0
+        for p in row.procs:
+            if p.pid in (1, os.getpid()):
+                continue
+            try:
+                os.kill(p.pid, sig)
+                ok += 1
+            except PermissionError:
+                denied += 1
+            except ProcessLookupError:
+                pass
+        how = "Force-ended" if sig == signal.SIGKILL else "Asked to close"
+        T = self.theme
+        if denied and not ok:
+            self.say(f"Not allowed to end {row.name} — it belongs to {row.user}. "
+                     "Run shtop with sudo for that.", T.red, 6)
+        elif denied:
+            self.say(f"{how} {ok} of {ok + denied} {row.name} processes (no permission for the rest)", T.yellow, 6)
+        else:
+            n = f" ({ok} processes)" if ok > 1 else ""
+            self.say(f"{how} {row.name}{n}", T.green)
+
+    # ── drawing primitives ──
+    def pill(self, x, y, text, color, fg=None, bold=True):
+        """A rounded label:  text  — returns its width."""
+        s = self.scr
+        s.put(x, y, CAP_L, color)
+        s.put(x + 1, y, text, fg or self.theme.bg, color, bold=bold)
+        s.put(x + 1 + len(text), y, CAP_R, color)
+        return len(text) + 2
+
+    def soft_pill(self, x, y, text, color):
+        """A tinted pill: coloured text on a faint wash of the same colour."""
+        tint = mix(color, self.theme.bg, 0.82)
+        return self.pill(x, y, text, tint, color, bold=False)
+
+    def keycap(self, x, y, key, label):
+        T, s = self.theme, self.scr
+        s.put(x, y, f" {key} ", T.accent, T.sel, bold=True)
+        s.put(x + len(key) + 3, y, label, T.dim)
+        return len(key) + 3 + len(label)
+
+    def panel(self, x, y, w, h, icon, title, color, right="", right_color=None):
+        s, T = self.scr, self.theme
+        B = mix(color, T.bg, 0.6)
+        s.put(x, y, "╭" + "─" * (w - 2) + "╮", B)
+        for r in range(1, h - 1):
+            s.put(x, y + r, "│", B)
+            s.put(x + w - 1, y + r, "│", B)
+        s.put(x, y + h - 1, "╰" + "─" * (w - 2) + "╯", B)
+        pw = self.pill(x + 2, y, f"{icon} {title}", color)
+        room = w - pw - 8
+        if right and room > 4:
+            rr = f" {trunc(right, room - 2)} "
+            s.put(x + w - 2 - len(rr), y, rr, right_color or T.dim)
+
+    def meter(self, x, y, w, frac, color, track=None):
+        """Thick line on a thin track. color may be a function of position (0..1)."""
+        if w <= 0:
+            return
+        s, T = self.scr, self.theme
+        n = max(0.0, min(1.0, frac)) * w
+        full = int(n)
+        half = n - full >= 0.5
+        grad = callable(color)
+        for i in range(w):
+            c = color(i / max(1, w - 1)) if grad else color
+            if i < full:
+                s.put(x + i, y, "━", c)
+            elif i == full and half:
+                s.put(x + i, y, "╸", c)
+            else:
+                s.put(x + i, y, "─", track or T.track)
+
+    def stacked(self, x, y, w, parts):
+        total = sum(v for v, _ in parts) or 1
+        pos, acc = x, 0.0
+        for i, (v, c) in enumerate(parts):
+            acc += v
+            end = x + (w if i == len(parts) - 1 else round(acc / total * w))
+            for xx in range(pos, end):
+                col = c((xx - pos) / max(1, end - pos - 1)) if callable(c) else c
+                self.scr.put(xx, y, "━" if c is not None else "─", col or self.theme.track)
+            pos = end
+
+    def graph(self, x, y, w, h, values, color_at, down=False, glow=0.6, floor=True):
+        """Bar graph, newest sample on the right.
+
+        Rows are coloured by height via color_at(f); lower rows fade towards the
+        background and the top of every bar is drawn at full strength, which
+        gives a soft glowing area chart."""
+        if w <= 0 or h <= 0:
+            return
+        s, T = self.scr, self.theme
+        vals = list(values)[-w:]
+        off = x + w - len(vals)
+        body = [mix(color_at((r + 0.5) / h), T.bg, glow * (1 - (r + 0.5) / h)) for r in range(h)]
+        crest = [color_at((r + 0.5) / h) for r in range(h)]
+        for i, v in enumerate(vals):
+            total = max(0.0, min(1.0, v)) * h * 8
+            if floor and v > 0.002 and total < 1:
+                total = 1
+            top = math.ceil(total / 8) - 1
+            for r in range(top + 1):
+                lvl = min(8, max(0, round(total - r * 8)))
+                if not lvl:
+                    break
+                col = crest[r] if r == top else body[r]
+                if not down:
+                    s.put(off + i, y + h - 1 - r, BLOCKS[lvl], col)
+                elif lvl == 8:
+                    s.put(off + i, y + r, "█", col)
+                else:
+                    # grow downwards: paint the cell in the bar colour and cover the
+                    # bottom with a background-coloured lower block
+                    s.put(off + i, y + r, BLOCKS[8 - lvl], T.bg, col)
+
+    def spark(self, x, y, w, values, color_at):
+        vals = list(values)[-w:]
+        off = x + w - len(vals)
+        for i, v in enumerate(vals):
+            f = min(1.0, v * 2)
+            lvl = max(1 if v > 0.001 else 0, round(f * 8))
+            if lvl:
+                self.scr.put(off + i, y, BLOCKS[lvl], color_at(f))
+
+    # ── header & footer ──
+    def draw_header(self, W):
+        s, T, A = self.scr, self.theme, self.anim
+        s.put(1, 0, ICON["LOGO"], T.accent, bold=True)
+        word = "shtop"
+        for i, ch in enumerate(word):
+            s.put(3 + i, 0, ch, mix(T.accent, T.magenta, i / (len(word) - 1)), bold=True)
+        x = 3 + len(word) + 2
+        s.put(x, 0, self.hostname, T.fg)
+        x += len(self.hostname)
+        s.put(x, 0, "  ·  ", T.muted)
+        s.put(x + 5, 0, self.theme.name, T.dim)
+        x += 5 + len(self.theme.name)
+
+        up = float((read("/proc/uptime", "0") or "0").split()[0])
+        chips = []
+        if self.bat.present:
+            pct = A("bat", self.bat.pct)
+            col = T.green if self.bat.status == "Charging" else T.sev(1 - pct / 100)
+            chips.append((f"{self.bat.icon()} {pct:.0f}%", col))
+        chips.append((f"{ICON['CLOCK']} up {fmt_dur(up)}", T.dim))
+        chips.append((time.strftime("%H:%M"), T.bright))
+        rw = sum(len(t) for t, _ in chips) + 3 * (len(chips) - 1) + 1
+        rx = W - rw
+        for i, (text, col) in enumerate(chips):
+            if i:
+                s.put(rx, 0, " · ", T.muted)
+                rx += 3
+            s.put(rx, 0, text, col, bold=col == T.bright)
+            rx += len(text)
+
+        msg, col = getattr(self, "_insight", None) or self.insight()
+        room = W - rw - x - 6
+        if room > 14:
+            text = " " + trunc(msg, room - 6) + " "
+            pw = len(text) + 4
+            cx = max(x + 2, (W - pw) // 2)
+            if cx + pw > W - rw - 1:
+                cx = x + 2
+            tint = mix(col, T.bg, 0.82)
+            s.put(cx, 0, CAP_L, tint)
+            s.put(cx + 1, 0, " ●", col, tint)
+            s.put(cx + 3, 0, text, T.bright, tint)
+            s.put(cx + 3 + len(text), 0, CAP_R, tint)
+
+    def insight(self):
+        T = self.theme
+        procs = getattr(self, "groups", [])
+        top_cpu = max(procs, key=lambda p: p.cpu, default=None)
+        top_mem = max(procs, key=lambda p: p.mem, default=None)
+        cpu, memf = self.cpu.total, self.mem.used / self.mem.total
+        full = [d for d in self.disks.mounts if d["frac"] > 0.92 and d["fs"] not in ("9p", "nfs", "nfs4", "cifs")]
+        if cpu > 0.85 and top_cpu:
+            return f"CPU is maxed out — {top_cpu.name} is using {top_cpu.cpu * 100:.0f}%", T.red
+        if memf > 0.9 and top_mem:
+            return f"Memory is almost full — {top_mem.name} holds {fmt_bytes(top_mem.mem)}", T.red
+        if self.sens.cpu_temp and self.sens.cpu_temp >= 90:
+            return f"CPU is running hot ({self.sens.cpu_temp:.0f}°C)", T.red
+        if self.bat.present and self.bat.status == "Discharging" and self.bat.pct <= 15:
+            return f"Battery low — {self.bat.pct}% left", T.red
+        if full:
+            return f"{Disks.label(full[0]['mnt'])} drive is almost full ({full[0]['frac'] * 100:.0f}%)", T.yellow
+        if self.mem.swap_total and self.mem.swap_used / self.mem.swap_total > 0.5 and not self.mem.zram:
+            return "Low on memory — the system is leaning on swap", T.yellow
+        if memf > 0.75 and top_mem:
+            return f"Memory is getting tight — biggest is {top_mem.name} ({fmt_bytes(top_mem.mem)})", T.yellow
+        if cpu > 0.5 and top_cpu:
+            return f"Busy — mostly {top_cpu.name} ({top_cpu.cpu * 100:.0f}% CPU)", T.yellow
+        if cpu > 0.15 and top_cpu and top_cpu.cpu > 0.05:
+            return f"Working lightly — {top_cpu.name} is most active", T.green
+        return "All calm — nothing is working hard", T.green
+
+    def draw_footer(self, W, H):
+        s, T = self.scr, self.theme
+        y = H - 1
+        if self.filtering:
+            x = 1 + self.pill(1, y, f"{ICON['SEARCH']} Search", T.accent)
+            s.put(x + 1, y, self.filter, T.bright, bold=True)
+            s.put(x + 1 + len(self.filter), y, "▏", T.accent)
+            hx = W - 1
+            for k, label in reversed([("⏎", "keep"), ("esc", "clear")]):
+                hx -= len(k) + 3 + len(label) + 2
+                self.keycap(hx, y, k, label)
+            return
+        if self.toast and time.monotonic() < self.toast_until:
+            msg, col = self.toast
+            self.soft_pill(1, y, f"● {trunc(msg, W - 6)}", col or T.accent)
+            return
+        keys = [("↑↓", "select"), ("⏎", "details"), ("/", "search"),
+                ("g", "processes" if self.grouped else "group by app"),
+                ("s", f"sort: {SORT_NAMES[self.sort]}"), ("del", "end"), ("?", "help"), ("q", "quit")]
+        x = 1
+        for k, label in keys:
+            need = len(k) + 3 + len(label) + 2
+            if x + need > W:
+                break
+            x += self.keycap(x, y, k, label) + 2
+        if self.interval != 1.0 and x + 12 < W:
+            t = f"every {self.interval:g}s"
+            s.put(W - len(t) - 1, y, t, T.dim)
+
+    # ── panels ──
+    def draw_cpu(self, x, y, w, h):
+        s, T, c, A = self.scr, self.theme, self.cpu, self.anim
+        self.panel(x, y, w, h, ICON["CPU"], "CPU", T.blue, c.model)
+        ix, iy, iw, ih = x + 2, y + 1, w - 4, h - 2
+        pct = A("cpu", c.total)
+        big = f"{pct * 100:.0f}%"
+        word = ("idle" if c.total < 0.05 else "relaxed" if c.total < 0.25 else "working" if c.total < 0.5
+                else "busy" if c.total < 0.85 else "maxed out")
+        s.put(ix, iy, big, T.sev(pct), bold=True)
+        s.put(ix + len(big) + 1, iy, word, T.fg)
+        chips = []
+        if c.freq:
+            chips.append((f"{ICON['FREQ']} {A('freq', c.freq):.1f} GHz", T.cyan))
+        if self.sens.cpu_temp:
+            t = A("ctemp", self.sens.cpu_temp)
+            chips.append((f"{ICON['TEMP']} {t:.0f}°C", T.temp(t)))
+        rx = ix + iw
+        for text, col in reversed(chips):
+            pw = len(text) + 4
+            if rx - pw < ix + len(big) + len(word) + 3:
+                break
+            rx -= pw
+            self.soft_pill(rx, iy, f" {text} ", col)
+            rx -= 1
+
+        gh = ih - 2
+        if gh >= 1:
+            n = len(c.per)
+            col_w = len(str(n)) + 1 + 6 + 5
+            cols = -(-n // gh) if n else 0
+            core_w = cols * (col_w + 2) if n else 0
+            gw = iw
+            if n and core_w <= iw * 0.45:
+                cx0 = ix + iw - core_w + 2
+                for i in range(n):
+                    v = A(f"core{i}", c.per[i])
+                    cx = cx0 + (i // gh) * (col_w + 2)
+                    cy = iy + 1 + (i % gh)
+                    lab = str(i + 1).rjust(len(str(n)))
+                    s.put(cx, cy, lab, T.dim)
+                    self.meter(cx + len(lab) + 1, cy, 6, v, T.sev)
+                    s.put(cx + len(lab) + 8, cy, f"{v * 100:3.0f}%", T.sev(v) if v > 0.01 else T.dim)
+                gw = iw - core_w - 1
+            elif n and iw >= 30:
+                per_row = max(1, (iw * 4 // 10) // 2)
+                if -(-n // per_row) <= gh:
+                    cx0 = ix + iw - per_row * 2 + 1
+                    for i in range(n):
+                        v = A(f"core{i}", c.per[i])
+                        s.put(cx0 + (i % per_row) * 2, iy + 1 + i // per_row, "■",
+                              T.sev(v) if v > 0.02 else T.track)
+                    gw = iw - per_row * 2 - 2
+            if gh >= 3:
+                s.put(ix, iy + 1 + gh // 2, "┈" * gw, mix(T.muted, T.bg, 0.45))
+            hist = list(c.hist)
+            if hist:
+                hist[-1] = A("cpu_last", hist[-1])
+            self.graph(ix, iy + 1, gw, gh, hist, T.sev)
+            if gh >= 3:
+                span = fmt_dur(gw * self.fast_interval)
+                s.put_soft(ix, iy + 1, f"last {span}", T.dim)
+                if gw > 20:
+                    s.put_soft(ix + gw - 4, iy + 1 + gh // 2, "50%", mix(T.muted, T.bg, 0.2))
+
+        if ih >= 2:
+            l1, l5, l15 = c.load
+            parts = [("Load ", T.dim), (f"{l1:.2f}", T.sev(l1 / c.threads)),
+                     (f"  {l5:.2f}  {l15:.2f}", T.fg), ("  ·  ", T.muted),
+                     (f"{c.cores} cores / {c.threads} threads", T.dim),
+                     ("  ·  ", T.muted), (f"{len(self.procs.list)} processes", T.dim)]
+            px = ix
+            for text, col in parts:
+                text = trunc(text, ix + iw - px)
+                s.put(px, iy + ih - 1, text, col)
+                px += len(text)
+
+    def draw_mem(self, x, y, w, h):
+        s, T, m, A = self.scr, self.theme, self.mem, self.anim
+        self.panel(x, y, w, h, ICON["MEM"], "Memory", T.magenta, f"{fmt_bytes(m.total)} total")
+        ix, iy, iw, ih = x + 2, y + 1, w - 4, h - 2
+        used, cache, free = A("m_used", m.used), A("m_cache", m.cache), A("m_free", m.free)
+        frac = used / m.total
+        u = fmt_bytes(used)
+        s.put(ix, iy, u, T.sev(frac), bold=True)
+        s.put(ix + len(u) + 1, iy, "in use", T.fg)
+        avail = f"{fmt_bytes(m.avail)} available"
+        p = f"{frac * 100:.0f}%"
+        s.put(ix + iw - len(p), iy, p, T.sev(frac), bold=True)
+        if iw - len(p) - len(u) - 10 > len(avail) + 2:
+            s.put(ix + iw - len(p) - len(avail) - 3, iy, avail, T.dim)
+        row = iy + 1
+        def mag(f):
+            return mix(mix(T.magenta, T.bg, 0.25), T.magenta, f)
+
+        def cy_(f):
+            return mix(mix(T.cyan, T.bg, 0.25), T.cyan, f)
+
+        if ih >= 3:
+            self.stacked(ix, row, iw, [(used, mag), (cache, cy_), (free, None)])
+            row += 1
+        legend = [("In use", used, T.magenta, "held by running apps"),
+                  ("Cache", cache, T.cyan, "speeds up files, freed when needed"),
+                  ("Free", free, T.dim, "completely unused")]
+        left = iy + ih - row
+        has_swap = m.swap_total > 0
+        if left >= 3 + has_swap + 1:
+            for name, val, col, why in legend:
+                s.put(ix, row, "●", col)
+                s.put(ix + 2, row, name, T.fg)
+                s.put(ix + 9, row, fmt_bytes(val).rjust(8), T.bright)
+                s.put(ix + 18, row, f"{val / m.total * 100:3.0f}%", T.dim)
+                s.put(ix + 24, row, trunc(why, iw - 24), mix(T.dim, T.bg, 0.15))
+                row += 1
+        elif left >= 1 + has_swap:
+            px = ix
+            for name, val, col, _ in legend:
+                t = f"{name} {fmt_bytes(val)}"
+                if px + len(t) + 2 > ix + iw:
+                    break
+                s.put(px, row, "●", col)
+                s.put(px + 2, row, t, T.fg)
+                px += len(t) + 5
+            row += 1
+        if has_swap and row < iy + ih:
+            sf = A("swap", m.swap_used / m.swap_total)
+            lab = "Swap (zram)" if m.zram else "Swap"
+            val = f"{fmt_bytes(m.swap_used)} / {fmt_bytes(m.swap_total)}"
+            s.put(ix, row, lab, T.fg)
+            self.meter(ix + len(lab) + 1, row, iw - len(lab) - len(val) - 2, sf, T.sev)
+            s.put(ix + iw - len(val), row, val, T.dim)
+            row += 1
+        gh = iy + ih - row
+        if gh >= 2:
+            hist = list(m.hist)
+            if hist:
+                hist[-1] = A("mem_last", hist[-1])
+            self.graph(ix, row, iw, gh, hist, lambda f: mix(T.magenta, T.red, max(0, f - 0.6)))
+
+    def draw_net(self, x, y, w, h):
+        s, T, n, A = self.scr, self.theme, self.net, self.anim
+        right = n.iface or "offline"
+        if n.signal is not None:
+            right = f"{ICON['WIFI']} {n.signal}% · " + right
+        self.panel(x, y, w, h, ICON["NET"], "Network", T.cyan, right)
+        ix, iy, iw, ih = x + 2, y + 1, w - 4, h - 2
+        down, up = A("down", n.down), A("up", n.up)
+        d, u = f"↓ {fmt_rate(down)}", f"↑ {fmt_rate(up)}"
+        s.put(ix, iy, d, T.cyan, bold=True)
+        s.put(ix + len(d) + 1, iy, "download", T.dim)
+        s.put(ix + iw - len(u), iy, u, T.magenta, bold=True)
+        s.put(ix + iw - len(u) - 7, iy, "upload", T.dim)
+        gh = ih - 2
+        if gh >= 3:
+            uh_ = gh // 2
+            dh_ = gh - uh_ - 1
+            axis = iy + 1 + dh_
+            dvals, uvals = list(n.dh)[-iw:], list(n.uh)[-iw:]
+            dmax = A("dmax", max(dvals + [16 * 1024]))
+            umax = A("umax", max(uvals + [16 * 1024]))
+            s.put(ix, axis, "─" * iw, mix(T.muted, T.bg, 0.3))
+            scale = f" scale ↓{fmt_rate(dmax)}  ↑{fmt_rate(umax)} "
+            if len(scale) + 4 < iw:
+                s.put(ix + iw - len(scale) - 1, axis, scale, mix(T.dim, T.bg, 0.2))
+            if dvals:
+                dvals[-1] = A("down_last", dvals[-1])
+            if uvals:
+                uvals[-1] = A("up_last", uvals[-1])
+            self.graph(ix, iy + 1, iw, dh_, [v / dmax for v in dvals], lambda f: mix(T.cyan, T.blue, f),
+                       floor=False)
+            self.graph(ix, axis + 1, iw, uh_, [v / umax for v in uvals],
+                       lambda f: mix(T.magenta, T.red, f * 0.5), down=True, glow=0, floor=False)
+        if ih >= 2:
+            foot = f"Since boot  ↓ {fmt_bytes(n.rx_total)}   ↑ {fmt_bytes(n.tx_total)}"
+            s.put(ix, iy + ih - 1, trunc(foot, iw), T.dim)
+            if n.ip and len(foot) + len(n.ip) + 4 <= iw:
+                s.put(ix + iw - len(n.ip), iy + ih - 1, n.ip, T.fg)
+
+    def draw_disks(self, x, y, w, h):
+        s, T, dk, A = self.scr, self.theme, self.disks, self.anim
+        self.panel(x, y, w, h, ICON["DISK"], "Storage", T.yellow)
+        ix, iy, iw, ih = x + 2, y + 1, w - 4, h - 2
+        mounts = dk.mounts
+        rd, wr = A("rd", dk.read_rate), A("wr", dk.write_rate)
+        io_rows = 1 if ih >= len(mounts) + 2 else 0
+        if not mounts:
+            s.put(ix, iy, "No drives found", T.dim)
+            return
+        two = ih - io_rows >= len(mounts) * 2
+        name_w = min(12, max(len(Disks.label(m["mnt"])) for m in mounts))
+        row = iy
+        for m in mounts:
+            if row >= iy + ih - io_rows:
+                break
+            frac = A("disk" + m["mnt"], m["frac"])
+            lab = trunc(Disks.label(m["mnt"]), name_w)
+            pct = f"{frac * 100:3.0f}%"
+            s.put(ix, row, lab, T.fg)
+            self.meter(ix + name_w + 1, row, iw - name_w - len(pct) - 2, frac, T.sev)
+            s.put(ix + iw - len(pct), row, pct, T.sev(frac), bold=True)
+            row += 1
+            if two and row < iy + ih - io_rows:
+                net = m["fs"] in ("9p", "virtiofs", "nfs", "nfs4", "cifs", "smb3")
+                detail = (f"{fmt_bytes(m['free'])} free of {fmt_bytes(m['total'])}  ·  {m['mnt']}"
+                          f"{'  (shared)' if net else ''}")
+                s.put(ix + name_w + 1, row, trunc(detail, iw - name_w - 1), T.dim)
+                row += 1
+        if io_rows:
+            ry = iy + ih - 1
+            r_t, w_t = f"read {fmt_rate(rd)}", f"write {fmt_rate(wr)}"
+            s.put(ix, ry, "●", T.green if rd > 1024 else T.track)
+            s.put(ix + 2, ry, r_t, T.fg if rd > 1024 else T.dim)
+            s.put(ix + 5 + len(r_t), ry, "●", T.orange if wr > 1024 else T.track)
+            s.put(ix + 7 + len(r_t), ry, w_t, T.fg if wr > 1024 else T.dim)
+
+    def draw_sys(self, x, y, w, h):
+        s, T, A = self.scr, self.theme, self.anim
+        self.panel(x, y, w, h, ICON["BOLT"], "Power & Sensors", T.orange)
+        ix, iy, iw, ih = x + 2, y + 1, w - 4, h - 2
+        lines = []  # (label, frac, value, colour or gradient, value colour, sub)
+        b = self.bat
+        if b.present:
+            pct = A("bat", b.pct)
+            col = T.green if b.status == "Charging" else T.sev(1 - pct / 100)
+            grad = (lambda f: mix(mix(T.green, T.bg, 0.4), T.green, f)) if b.status == "Charging" \
+                else (lambda f: T.sev(1 - f))
+            lines.append((f"{b.icon()} Battery", pct / 100, f"{pct:.0f}%", grad, col, b.describe()))
+        for i, g in enumerate(self.gpu.items):
+            busy = A(f"gpu{i}", g[1])
+            sub = f"VRAM {fmt_bytes(g[2])} / {fmt_bytes(g[3])}" if g[2] and g[3] else None
+            lines.append((f"{ICON['GPU']} GPU", busy, f"{busy * 100:.0f}%", T.sev, T.sev(busy), sub))
+        for label, c in self.sens.temps:
+            c = A("t" + label, c)
+            lines.append((f"{ICON['TEMP']} {label}", (c - 20) / 80, f"{c:.0f}°C",
+                          lambda f: T.temp(20 + f * 80), T.temp(c), None))
+        for label, rpm in self.sens.fans[:3]:
+            lines.append((f"{ICON['FAN']} {label}", min(1, rpm / 6000), f"{rpm} rpm", T.cyan, T.cyan, None))
+        if not lines:
+            s.put(ix, iy, "No battery or sensors reported.", T.dim)
+            if ih > 1:
+                s.put(ix, iy + 1, trunc("Normal inside a virtual machine.", iw), T.dim)
+            return
+        need = sum(1 + (1 if line[5] else 0) for line in lines)
+        row = iy
+        lab_w = min(14, max(len(line[0]) for line in lines))
+        for label, frac, val, grad, vcol, sub in lines:
+            if row >= iy + ih:
+                break
+            s.put(ix, row, trunc(label, lab_w), T.fg)
+            self.meter(ix + lab_w + 1, row, iw - lab_w - len(val) - 2, frac, grad)
+            s.put(ix + iw - len(val), row, val, vcol, bold=True)
+            row += 1
+            if sub and need <= ih and row < iy + ih:
+                s.put(ix + lab_w + 1, row, trunc(sub, iw - lab_w - 1), T.dim)
+                row += 1
+
+    # ── process table ──
+    def columns(self, iw):
+        if self.grouped:
+            cols = [("name", "App", 0), ("count", "Procs", 5), ("cpu", "CPU", 13), ("trend", "Trend", 10),
+                    ("mem", "Memory", 16), ("user", "User", 10)]
+            if iw > 120:
+                cols.append(("cmd", "Command", 0))
+        else:
+            cols = [("name", "Name", 0), ("pid", "PID", 8), ("cpu", "CPU", 13), ("trend", "Trend", 10),
+                    ("mem", "Memory", 16), ("state", "State", 10), ("user", "User", 10), ("cmd", "Command", 0)]
+        if iw < 100:
+            cols = [c for c in cols if c[0] not in ("cmd", "state")]
+        if iw < 76:
+            cols = [c for c in cols if c[0] not in ("user", "trend")]
+        fixed = sum(c[2] + 1 for c in cols if c[2])
+        flex = [c for c in cols if not c[2]]
+        rest = max(8, iw - fixed - len(flex))
+        out = []
+        for key, title, width in cols:
+            if not width:
+                if key == "name" and len(flex) > 1:
+                    width = max(16, min(30, rest // 3))
+                elif key == "name":
+                    width = rest
+                else:
+                    width = max(0, rest - max(16, min(30, rest // 3)))
+            out.append((key, title, width))
+        return out
+
+    def draw_procs(self, x, y, w, h):
+        s, T = self.scr, self.theme
+        total = len([p for p in self.procs.list if self.show_kernel or not p.kernel])
+        right = (f"{len(self.rows)} apps · {total} processes" if self.grouped
+                 else f"{len(self.rows)} processes")
+        if self.filter:
+            right = f"{ICON['SEARCH']} “{self.filter}” · " + right
+        self.panel(x, y, w, h, ICON["APPS"], "Apps" if self.grouped else "Processes", T.accent, right,
+                   T.accent if self.filter else None)
+        ix, iy, iw, ih = x + 2, y + 1, w - 4, h - 2
+        cols = self.columns(iw)
+        cx = ix
+        self.header_hits = []
+        for key, title, width in cols:
+            arrow = ""
+            if key == self.sort:
+                desc = (key in ("cpu", "mem", "count")) != self.reverse
+                arrow = " ▾" if desc else " ▴"
+            text = title + arrow
+            if key in ("count", "pid"):
+                tx = cx + width - len(text)
+            elif key == "mem":
+                tx = cx + 10 - len(text)
+            elif key == "name":
+                tx = cx + 2
+            else:
+                tx = cx
+            s.put(tx, iy, trunc(text, width), T.accent if key == self.sort else T.dim, bold=key == self.sort)
+            if key in SORTS:
+                self.header_hits.append((cx, cx + width, key))
+            cx += width + 1
+        vis = ih - 1
+        if vis <= 0:
+            return
+        if self.sel < self.scroll:
+            self.scroll = self.sel
+        if self.sel >= self.scroll + vis:
+            self.scroll = self.sel - vis + 1
+        self.scroll = max(0, min(self.scroll, max(0, len(self.rows) - vis)))
+        self.table = (iy + 1, vis, self.scroll, iy)
+        me = self.procs.user(os.getuid())
+        for i, r in enumerate(self.rows[self.scroll:self.scroll + vis]):
+            ry = iy + 1 + i
+            selected = self.scroll + i == self.sel
+            if selected:
+                s.fill(x + 1, ry, w - 2, 1, T.sel)
+                s.put(x + 1, ry, "▌", T.accent)
+            cx = ix
+            for key, _title, width in cols:
+                if width <= 0:
+                    continue
+                if key == "name":
+                    icon, icol = app_icon(r.name, r.kernel, T)
+                    s.put(cx, ry, icon, icol)
+                    s.put(cx + 2, ry, trunc(r.name, width - 2), T.bright if selected else T.fg, bold=selected)
+                elif key == "count":
+                    t = str(r.count) if r.count > 1 else ""
+                    s.put(cx + width - len(t), ry, t, T.dim)
+                elif key == "pid":
+                    t = str(r.pid)
+                    s.put(cx + width - len(t), ry, t, T.dim)
+                elif key == "cpu":
+                    v = r.cpu
+                    if v >= 0.0005:
+                        self.meter(cx, ry, 6, min(1.0, v * 2), T.sev, mix(T.track, T.bg, 0.3))
+                        s.put(cx + 7, ry, f"{v * 100:5.1f}%", T.sev(min(1.0, v * 1.5)))
+                    else:
+                        s.put(cx + 7, ry, "    –", T.muted)
+                elif key == "trend":
+                    hist = self.trend.get(r.key, ())
+                    if any(v > 0.001 for v in hist):
+                        self.spark(cx, ry, width - 1, hist, T.sev)
+                    else:
+                        s.put(cx, ry, "·" * (width - 1), mix(T.muted, T.sel if selected else T.bg, 0.4))
+                elif key == "mem":
+                    f = r.mem / self.mem.total
+                    t = fmt_bytes(r.mem)
+                    col = T.sev(min(1.0, f * 2.5)) if f >= 0.05 else T.fg
+                    s.put(cx + 10 - len(t), ry, t, col)
+                    if f >= 0.005:
+                        self.meter(cx + 11, ry, 5, min(1.0, f * 4),
+                                   lambda p: mix(mix(T.magenta, T.bg, 0.4), T.magenta, p), mix(T.track, T.bg, 0.3))
+                elif key == "state":
+                    st = r.state
+                    col = {"R": T.green, "D": T.yellow, "Z": T.red, "T": T.orange}.get(st, T.dim)
+                    s.put(cx, ry, "●", col)
+                    s.put(cx + 2, ry, trunc(STATES.get(st, st), width - 2), col if st in "RDZT" else T.dim)
+                elif key == "user":
+                    col = T.dim if r.user == me else (T.orange if r.user == "root" else T.yellow)
+                    s.put(cx, ry, trunc(r.user, width), col)
+                elif key == "cmd":
+                    s.put(cx, ry, trunc(r.cmd, width), mix(T.dim, T.bg, 0.1))
+                cx += width + 1
+        if not self.rows:
+            msg = f"Nothing matches “{self.filter}”" if self.filter else "No processes"
+            s.put(ix + (iw - len(msg)) // 2, iy + vis // 2, msg, T.dim)
+        if len(self.rows) > vis:
+            th = max(1, vis * vis // len(self.rows))
+            ty = iy + 1 + (vis - th) * self.scroll // max(1, len(self.rows) - vis)
+            for yy in range(iy + 1, iy + 1 + vis):
+                on = ty <= yy < ty + th
+                s.put(x + w - 1, yy, "┃" if on else "│", T.accent if on else mix(T.accent, T.bg, 0.6))
+
+    # ── overlays ──
+    def modal(self, w, h, title, color, icon=""):
+        W, H = self.scr.w, self.scr.h
+        w, h = min(w, W - 4), min(h, H - 2)
+        x, y = (W - w) // 2, (H - h) // 2
+        s, T = self.scr, self.theme
+        s.fill(x, y, w, h, T.bg)
+        s.put(x, y, "╭" + "─" * (w - 2) + "╮", color, T.bg)
+        for r in range(1, h - 1):
+            s.put(x, y + r, "│", color, T.bg)
+            s.put(x + w - 1, y + r, "│", color, T.bg)
+        s.put(x, y + h - 1, "╰" + "─" * (w - 2) + "╯", color, T.bg)
+        self.pill(x + 2, y, f"{icon} {title}" if icon else title, color)
+        return x + 2, y + 1, w - 4, h - 2
+
+    def draw_detail(self):
+        r = self.current()
+        if not r:
+            self.overlay = None
+            return
+        s, T = self.scr, self.theme
+        icon, icol = app_icon(r.name, r.kernel, T)
+        ix, iy, iw, ih = self.modal(92, 28, r.name, T.accent, icon)
+        bg = T.bg
+        row = iy + 1
+
+        def kv(label, value, col=None):
+            nonlocal row
+            if row >= iy + ih - 2:
+                return
+            s.put(ix + 1, row, label, T.dim, bg)
+            s.put(ix + 15, row, trunc(str(value), iw - 16), col or T.fg, bg)
+            row += 1
+
+        # CPU history chart for this app/process
+        hist = list(self.trend.get(r.key, ()))
+        if ih >= 16:
+            gh = 4
+            s.put(ix + 1, row, "CPU over the last minute", T.dim, bg)
+            peak = max(hist + [0.0])
+            s.put(ix + iw - 12, row, f"peak {peak * 100:4.1f}%", T.dim, bg)
+            row += 1
+            scale = max(0.05, peak * 1.15)
+            s.put(ix + 1, row + gh // 2 - 0, "┈" * (iw - 2), mix(T.muted, T.bg, 0.45), bg)
+            self.graph(ix + 1, row, iw - 2, gh, [v / scale for v in hist], T.sev)
+            row += gh + 1
+
+        f = r.mem / self.mem.total
+        if r.count > 1:
+            kv("Processes", r.count)
+            kv("CPU", f"{r.cpu * 100:.1f}% of the whole machine", T.sev(min(1, r.cpu * 1.5)))
+            kv("Memory", f"{fmt_bytes(r.mem)}  ({f * 100:.1f}% of RAM)")
+            kv("Threads", r.threads)
+            kv("User", r.user)
+            row += 1
+            if row < iy + ih - 2:
+                s.put(ix + 1, row, f"{'PID':>8}  {'CPU':>6}  {'MEMORY':>9}  {'STATE':<9} COMMAND", T.dim, bg, bold=True)
+                row += 1
+            for p in sorted(r.procs, key=lambda p: (-p.cpu, -p.mem)):
+                if row >= iy + ih - 2:
+                    break
+                line = f"{p.pid:>8}  {p.cpu * 100:5.1f}%  {fmt_bytes(p.mem):>9}  {STATES.get(p.state, p.state):<9} "
+                s.put(ix + 1, row, line, T.fg, bg)
+                s.put(ix + 1 + len(line), row, trunc(p.cmd, iw - len(line) - 2), T.dim, bg)
+                row += 1
+        else:
+            parent = next((p for p in self.procs.list if p.pid == r.ppid), None)
+            started = self.procs.btime + r.start / self.procs.clk
+            kv("PID", r.pid)
+            kv("Parent", f"{parent.name} ({r.ppid})" if parent else r.ppid)
+            kv("User", r.user)
+            kv("State", f"{STATES.get(r.state, r.state)} — {STATE_HELP.get(r.state, '')}")
+            when = time.strftime("%a %H:%M", time.localtime(started))
+            kv("Started", f"{fmt_dur(time.time() - started)} ago  ({when})")
+            kv("CPU", f"{r.cpu * 100:.1f}% of the whole machine", T.sev(min(1, r.cpu * 1.5)))
+            kv("Memory", f"{fmt_bytes(r.mem)}  ({f * 100:.1f}% of RAM)")
+            kv("Threads", r.threads)
+            for label, link in (("Program", "exe"), ("Folder", "cwd")):
+                try:
+                    kv(label, os.readlink(f"/proc/{r.pid}/{link}"))
+                except OSError:
+                    pass
+            row += 1
+            if row < iy + ih - 2:
+                s.put(ix + 1, row, "Command", T.dim, bg)
+                row += 1
+            for line in textwrap.wrap(r.cmd, iw - 2) or [""]:
+                if row >= iy + ih - 2:
+                    break
+                s.put(ix + 1, row, line, T.fg, bg)
+                row += 1
+        hx = ix + 1
+        for k, label in [("del", "end"), ("shift+del", "force end"), ("↑↓", "browse"), ("esc", "close")]:
+            hx += self.keycap(hx, iy + ih - 1, k, label) + 2
+
+    def draw_confirm(self):
+        row, sig = self.confirm
+        s, T = self.scr, self.theme
+        force = sig == signal.SIGKILL
+        col = T.red if force else T.yellow
+        n = f" ({row.count} processes)" if row.count > 1 else ""
+        ix, iy, iw, ih = self.modal(64, 8, ("Force end " if force else "End ") + row.name + "?", col,
+                                    ICON["WARN"] if force else ICON["INFO"])
+        msg = ("Stops it immediately. Unsaved work will be lost." if force
+               else "Asks it to close nicely, like clicking the close button.")
+        icon, icol = app_icon(row.name, row.kernel, T)
+        s.put(ix + 1, iy + 1, icon, icol, T.bg)
+        s.put(ix + 3, iy + 1, trunc(row.name + n, iw - 4), T.bright, T.bg, bold=True)
+        s.put(ix + 1, iy + 2, trunc(msg, iw - 2), T.fg, T.bg)
+        x = ix + 1
+        x += self.pill(x, iy + 4, " y  yes, end it ", col) + 2
+        self.keycap(x, iy + 4, "n", "cancel")
+
+    def draw_help(self):
+        s, T = self.scr, self.theme
+        n = self.cpu.threads
+        sections = [
+            (ICON["CPU"], "CPU", T.blue, f"How hard the processor is working. The graph scrolls right-to-left; taller "
+             f"and redder means busier. Each numbered bar is one core. Load = how many tasks want the CPU "
+             f"(1, 5 and 15 minute averages) — anything under {n} means nothing is waiting."),
+            (ICON["MEM"], "Memory", T.magenta, "In use is held by apps. Cache is spare RAM Linux uses to remember "
+             "files — it's handed back instantly, so it isn't really 'used'. Swap is disk pretending to be "
+             "RAM; if it fills up, things get slow."),
+            (ICON["NET"], "Network", T.cyan, "Download grows up from the middle line, upload grows down. "
+             "The small numbers on the right are the graph's scale."),
+            (ICON["DISK"], "Storage", T.yellow, "How full each drive is, and whether anything is reading or "
+             "writing right now."),
+            (ICON["BOLT"], "Power", T.orange, "Battery, temperatures and fans when your hardware reports them."),
+            (ICON["APPS"], "Apps", T.accent, "Everything running, grouped by app. CPU % is a share of the whole "
+             "machine: 100% means every core is fully busy. Trend shows the last few seconds."),
+        ]
+        keys = [("↑↓ j k", "move"), ("PgUp PgDn", "page"), ("⏎ click", "details"),
+                ("/", "search"), ("g", "apps ⇄ processes"), ("s", "next sort"),
+                ("c m n p", "sort CPU/mem/name/PID"), ("r", "reverse sort"),
+                ("del x", "end (nicely)"), ("shift+del X", "force end"),
+                ("t", "kernel tasks"), ("a", "animations on/off"),
+                ("+ −", "update speed"), ("q", "quit")]
+        w = min(94, self.scr.w - 4)
+        need = 4 + sum(len(textwrap.wrap(t, w - 19)) + 1 for *_, t in sections) + 1 + (len(keys) + 1) // 2
+        ix, iy, iw, ih = self.modal(w, need, "shtop guide", T.accent, ICON["LOGO"])
+        bg = T.bg
+        row = iy + 1
+        for icon, title, col, text in sections:
+            lines = textwrap.wrap(text, iw - 15)
+            if row + len(lines) >= iy + ih - 9:
+                break
+            self.pill(ix + 1, row, f"{icon} {title}".ljust(10), col)
+            for line in lines:
+                s.put(ix + 15, row, line, T.fg, bg)
+                row += 1
+            row += 1
+        if row < iy + ih - 1:
+            s.put(ix + 1, row, "Keys", T.accent, bg, bold=True)
+            row += 1
+        colw = (iw - 2) // 2
+        for i, (k, label) in enumerate(keys):
+            r_ = row + i // 2
+            if r_ >= iy + ih:
+                break
+            cx = ix + 1 + (i % 2) * colw
+            pad = 13 - len(k)
+            self.keycap(cx + pad, r_, k, trunc(label, colw - 18))
+
+    # ── layout ──
+    def render(self):
+        s, T = self.scr, self.theme
+        self.anim.step()
+        s.clear()
+        W, H = s.w, s.h
+        if W < 60 or H < 15:
+            msg = "shtop needs a bit more room"
+            s.put(max(0, (W - len(msg)) // 2), H // 2, msg, T.fg)
+            sub = f"{W}×{H} — at least 60×15"
+            s.put(max(0, (W - len(sub)) // 2), H // 2 + 1, sub, T.dim)
+            return
+        self.draw_header(W)
+        avail = H - 2
+        y = 1
+        top_h = max(7, min(14, int(avail * 0.32)))
+        mid_h = max(6, min(9, int(avail * 0.24))) if avail >= 24 else 0
+        if avail - top_h - mid_h < 7:
+            mid_h = 0
+        if avail - top_h < 6:
+            top_h = max(5, avail - 6)
+        cw = W * 56 // 100 if W >= 100 else W // 2
+        self.draw_cpu(0, y, cw, top_h)
+        self.draw_mem(cw, y, W - cw, top_h)
+        y += top_h
+        if mid_h:
+            if W >= 110:
+                a = W // 3
+                self.draw_net(0, y, a, mid_h)
+                self.draw_disks(a, y, a, mid_h)
+                self.draw_sys(2 * a, y, W - 2 * a, mid_h)
+            else:
+                self.draw_net(0, y, W // 2, mid_h)
+                self.draw_disks(W // 2, y, W - W // 2, mid_h)
+            y += mid_h
+        self.draw_procs(0, y, W, H - 1 - y)
+        self.draw_footer(W, H)
+        if self.overlay == "detail":
+            self.draw_detail()
+        elif self.overlay == "confirm":
+            self.draw_confirm()
+        elif self.overlay == "help":
+            self.draw_help()
+
+    # ── input ──
+    def ask_kill(self, sig):
+        r = self.current()
+        if r:
+            self.confirm = (r, sig)
+            self.overlay = "confirm"
+
+    def on_key(self, k):
+        if k == "ctrl-c":
+            self.running = False
+            return
+        if isinstance(k, tuple):
+            return self.on_mouse(*k[1:])
+        if self.filtering:
+            if k == "enter" or k in ("up", "down"):
+                self.filtering = False
+                if k != "enter":
+                    self.move(-1 if k == "up" else 1)
+            elif k == "esc":
+                self.filter, self.filtering = "", False
+            elif k == "backspace":
+                self.filter = self.filter[:-1]
+            elif len(k) == 1 and k.isprintable():
+                self.filter += k
+                self.sel, self.sel_key = 0, None
+            self.build_rows()
+            return
+        if self.overlay == "confirm":
+            if k in ("y", "Y", "enter"):
+                self.kill(*self.confirm)
+                self.overlay = None
+            elif k in ("n", "N", "esc", "q"):
+                self.overlay = None
+            return
+        if self.overlay == "help":
+            self.overlay = None
+            return
+        if self.overlay == "detail":
+            if k in ("esc", "enter", "q", "left", "backspace"):
+                self.overlay = None
+            elif k in ("delete", "x"):
+                self.ask_kill(signal.SIGTERM)
+            elif k in ("shift-delete", "X"):
+                self.ask_kill(signal.SIGKILL)
+            elif k in ("up", "k"):
+                self.move(-1)
+            elif k in ("down", "j"):
+                self.move(1)
+            return
+        vis = self.table[1] if self.table else 10
+        if k in ("q", "Q"):
+            self.running = False
+        elif k == "esc":
+            if self.filter:
+                self.filter = ""
+                self.build_rows()
+        elif k in ("up", "k"):
+            self.move(-1)
+        elif k in ("down", "j"):
+            self.move(1)
+        elif k == "pgup":
+            self.move(-vis)
+        elif k == "pgdn":
+            self.move(vis)
+        elif k == "home":
+            self.move(-len(self.rows))
+        elif k in ("end", "G"):
+            self.move(len(self.rows))
+        elif k in ("enter", "right", "l"):
+            if self.current():
+                self.overlay = "detail"
+        elif k == "/":
+            self.filtering = True
+        elif k == "g":
+            self.grouped = not self.grouped
+            r = self.current()
+            self.sel_key = (r.procs[0].pid if not self.grouped else r.name) if r else None
+            if self.sort == "count" and not self.grouped:
+                self.sort = "cpu"
+            self.build_rows()
+        elif k == "s":
+            opts = [o for o in SORTS if self.grouped or o != "count"]
+            self.sort = opts[(opts.index(self.sort) + 1) % len(opts)] if self.sort in opts else "cpu"
+            self.reverse = False
+            self.build_rows()
+        elif k in ("c", "m", "n", "p"):
+            new = {"c": "cpu", "m": "mem", "n": "name", "p": "pid"}[k]
+            self.reverse = not self.reverse if self.sort == new else False
+            self.sort = new
+            self.build_rows()
+        elif k == "r":
+            self.reverse = not self.reverse
+            self.build_rows()
+        elif k == "t":
+            self.show_kernel = not self.show_kernel
+            self.say("Showing kernel tasks" if self.show_kernel else "Hiding kernel tasks")
+            self.build_rows()
+        elif k == "a":
+            self.anim.enabled = not self.anim.enabled
+            self.say("Animations on" if self.anim.enabled else "Animations off — numbers update instantly")
+        elif k in ("+", "="):
+            self.interval = max(0.5, self.interval / 2)
+            self.say(f"Updating every {self.interval:g}s")
+        elif k in ("-", "_"):
+            self.interval = min(8.0, self.interval * 2)
+            self.say(f"Updating every {self.interval:g}s")
+        elif k in ("delete", "x"):
+            self.ask_kill(signal.SIGTERM)
+        elif k in ("shift-delete", "X"):
+            self.ask_kill(signal.SIGKILL)
+        elif k in ("?", "h", "f1"):
+            self.overlay = "help"
+
+    def on_mouse(self, btn, mx, my, press):
+        if not press:
+            return
+        if self.overlay:
+            if btn == 0 and self.overlay in ("help", "detail"):
+                self.overlay = None
+            return
+        if btn == 64:
+            self.move(-3)
+            return
+        if btn == 65:
+            self.move(3)
+            return
+        if btn != 0 or not self.table:
+            return
+        y0, vis, scroll, hy = self.table
+        x, y = mx - 1, my - 1
+        if y == hy:
+            for a, b, key in self.header_hits:
+                if a <= x < b:
+                    if key == "count":
+                        self.sort, self.reverse = "count", False
+                        self.build_rows()
+                    else:
+                        self.on_key({"cpu": "c", "mem": "m", "name": "n", "pid": "p"}[key])
+            return
+        if y0 <= y < y0 + vis:
+            i = scroll + (y - y0)
+            if i < len(self.rows):
+                now = time.monotonic()
+                key = self.rows[i].key
+                if self.sel == i and self.last_click[1] == key:
+                    self.overlay = "detail"
+                self.sel, self.sel_key, self.picked = i, key, True
+                self.last_click = (now, key)
+
+
+# ───────────────────────────── terminal loop ────────────────────────
+
+KEYMAP = {"A": "up", "B": "down", "C": "right", "D": "left", "H": "home", "F": "end",
+          "1~": "home", "7~": "home", "4~": "end", "8~": "end", "5~": "pgup", "6~": "pgdn",
+          "3~": "delete", "3;2~": "shift-delete", "11~": "f1", "P": "f1"}
+CSI = re.compile(r"\x1b\[([0-9;]*)([A-Za-z~])")
+MOUSE = re.compile(r"\x1b\[<(\d+);(\d+);(\d+)([mM])")
+
+
+def parse_keys(data):
+    keys, i = [], 0
+    while i < len(data):
+        c = data[i]
+        if c == "\x1b":
+            m = MOUSE.match(data, i)
+            if m:
+                keys.append(("mouse", int(m.group(1)), int(m.group(2)), int(m.group(3)), m.group(4) == "M"))
+                i = m.end()
+                continue
+            m = CSI.match(data, i)
+            if m:
+                code = m.group(1) + "~" if m.group(2) == "~" else m.group(2)
+                keys.append(KEYMAP.get(code, "?unknown"))
+                i = m.end()
+                continue
+            if data.startswith("\x1bO", i) and i + 2 < len(data):
+                keys.append(KEYMAP.get(data[i + 2], "?unknown"))
+                i += 3
+                continue
+            keys.append("esc")
+            i += 1
+        elif c in "\r\n":
+            keys.append("enter")
+            i += 1
+        elif c in "\x7f\x08":
+            keys.append("backspace")
+            i += 1
+        elif c == "\x03":
+            keys.append("ctrl-c")
+            i += 1
+        elif c == "\t":
+            keys.append("tab")
+            i += 1
+        else:
+            keys.append(c)
+            i += 1
+    return [k for k in keys if k != "?unknown"]
+
+
+FRAME = 1 / 24  # animation frame time
+
+
+def run(opts):
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        sys.exit("shtop needs to run in a terminal")
+    fd, out = sys.stdin.fileno(), sys.stdout.fileno()
+    old = termios.tcgetattr(fd)
+    tty.setraw(fd)
+    try:
+        palette = query_terminal_palette(fd, out) if theme_file()[0] is None else None
+        app = App(Theme(palette), interval=opts.interval, animate=not opts.no_animation)
+    except BaseException:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        raise
+    rpipe, wpipe = os.pipe()
+    os.set_blocking(wpipe, False)
+    os.set_blocking(rpipe, False)
+    signal.set_wakeup_fd(wpipe)
+    flags = {"resize": True, "theme": False}
+    signal.signal(signal.SIGWINCH, lambda *_: flags.__setitem__("resize", True))
+    signal.signal(signal.SIGUSR2, lambda *_: flags.__setitem__("theme", True))
+    signal.signal(signal.SIGTERM, lambda *_: setattr(app, "running", False))
+
+    os.write(out, b"\x1b[?1049h\x1b[?25l\x1b[?7l\x1b[?1000h\x1b[?1006h\x1b]0;shtop\x07\x1b[2J")
+    try:
+        app.sample_fast()
+        app.sample()
+        now = time.monotonic()
+        next_fast = now + 0.25  # quick second sample so numbers appear fast
+        next_slow = now + 0.3
+        next_theme = now + 0.5
+        dirty = True
+        while app.running:
+            now = time.monotonic()
+            if flags["resize"]:
+                flags["resize"] = False
+                sz = shutil.get_terminal_size()
+                app.scr.resize(sz.columns, sz.lines)
+                os.write(out, b"\x1b[0m\x1b[2J")
+                dirty = True
+            if flags["theme"] or now >= next_theme:
+                next_theme = now + 0.5
+                if flags["theme"] or app.theme.changed():
+                    flags["theme"] = False
+                    old_name = app.theme.name
+                    app.theme.load()
+                    app.scr.prev = None
+                    if app.theme.name != old_name:
+                        app.say(f"Theme changed to {app.theme.name}", app.theme.accent)
+                    dirty = True
+            if now >= next_fast:
+                app.sample_fast()
+                next_fast = now + app.fast_interval
+                dirty = True
+            if now >= next_slow:
+                app.sample()
+                next_slow = now + app.interval
+                dirty = True
+            if app.toast and now >= app.toast_until:
+                app.toast = None
+                dirty = True
+            if dirty or app.anim.active:
+                app.render()
+                app.scr.flush()
+                dirty = False
+            wake = min(next_fast, next_slow, next_theme)
+            if app.anim.active:
+                wake = min(wake, time.monotonic() + FRAME)
+            timeout = max(0.0, wake - time.monotonic())
+            try:
+                ready, _, _ = select.select([fd, rpipe], [], [], timeout)
+            except InterruptedError:
+                ready = []
+            if rpipe in ready:
+                try:
+                    os.read(rpipe, 1024)
+                except BlockingIOError:
+                    pass
+            if fd in ready:
+                data = os.read(fd, 4096).decode(errors="ignore")
+                for k in parse_keys(data):
+                    app.on_key(k)
+                    if not app.running:
+                        break
+                dirty = True
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        os.write(out, b"\x1b[?1006l\x1b[?1000l\x1b[0m\x1b[?7h\x1b[?25h\x1b[?1049l")
+
+
+def dump(w, h, opts):
+    """Render one frame to stdout, e.g. for screenshots: shtop --dump 120x40"""
+    app = App(interval=opts.interval, animate=False)
+    app.sample_fast()
+    app.sample()
+    n = int(os.environ.get("SHTOP_DUMP_SAMPLES", "3"))
+    for i in range(n * 2):
+        time.sleep(0.25)
+        app.sample_fast()
+        if i % 2:
+            app.sample()
+    app.scr.resize(w, h)
+    app.overlay = os.environ.get("SHTOP_DUMP_OVERLAY") or None
+    if app.overlay == "confirm":
+        app.confirm = (app.current(), signal.SIGTERM)
+    if os.environ.get("SHTOP_DUMP_FILTER"):
+        app.filter = os.environ["SHTOP_DUMP_FILTER"]
+        app.filtering = True
+        app.build_rows()
+    app.render()
+    sys.stdout.write(app.scr.dump())
+
+
+def size(spec):
+    m = re.fullmatch(r"(\d+)x(\d+)", spec.lower())
+    if not m:
+        raise argparse.ArgumentTypeError("expected COLUMNSxROWS, e.g. 120x40")
+    return int(m.group(1)), int(m.group(2))
+
+
+def interval(spec):
+    try:
+        v = float(spec)
+    except ValueError:
+        raise argparse.ArgumentTypeError("expected a number of seconds") from None
+    if not 0.5 <= v <= 8:
+        raise argparse.ArgumentTypeError("must be between 0.5 and 8 seconds")
+    return v
+
+
+def parse_args(argv=None):
+    p = argparse.ArgumentParser(
+        prog="shtop",
+        description="A calm, readable system monitor for the terminal.",
+        epilog="Inside shtop, press ? for a guide to every panel and key. "
+               "Colours follow the current Omarchy theme, ~/.config/shtop/colors.toml, "
+               "or your terminal's palette.")
+    p.add_argument("-i", "--interval", type=interval, default=1.0, metavar="SECONDS",
+                   help="how often processes and drives refresh (0.5–8, default 1)")
+    p.add_argument("--no-animation", action="store_true",
+                   help="update numbers instantly instead of easing them (uses less CPU)")
+    icons = p.add_mutually_exclusive_group()
+    icons.add_argument("--icons", dest="icons", action="store_const", const=True,
+                       help="use Nerd Font icons (default when a Nerd Font is installed)")
+    icons.add_argument("--no-icons", dest="icons", action="store_const", const=False,
+                       help="use plain symbols that work with any font")
+    p.add_argument("--dump", type=size, metavar="COLSxROWS",
+                   help="print a single frame of that size and exit")
+    p.add_argument("-V", "--version", action="version", version=f"shtop {VERSION}")
+    return p.parse_args(argv)
+
+
+def main(argv=None):
+    opts = parse_args(argv)
+    icons = opts.icons
+    if icons is None:
+        env = os.environ.get("SHTOP_ICONS", "").lower()
+        icons = env in ("1", "yes", "true", "on") if env else nerd_font_installed()
+    use_icons(icons)
+    if opts.dump:
+        return dump(*opts.dump, opts)
+    try:
+        run(opts)
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()

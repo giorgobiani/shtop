@@ -1,0 +1,165 @@
+.TH SHTOP 1 "2026-10-04" "shtop 1.0.0" "User Commands"
+.nh
+.ad l
+.SH NAME
+shtop \- a calm, readable system monitor for the terminal
+.SH SYNOPSIS
+.B shtop
+.RB [ \-i
+.IR SECONDS ]
+.RB [ \-\-no\-animation ]
+.RB [ \-\-icons | \-\-no\-icons ]
+.RB [ \-\-dump
+.IR COLS x ROWS ]
+.SH DESCRIPTION
+.B shtop
+shows CPU, memory, network, storage, battery and temperatures, and every
+running app, on one screen. A status line at the top says in plain words how
+the system is doing, for example
+\fI\(lqAll calm \- nothing is working hard\(rq\fR
+or
+\fI\(lqMemory is almost full \- chromium holds 2.1 GB\(rq\fR.
+.PP
+Apps are grouped by name, so a browser with twenty processes is one row.
+Press
+.B ?
+inside shtop for a guide to every panel and key.
+.PP
+shtop reads
+.I /proc
+and
+.I /sys
+directly and needs nothing beyond Python 3.11 or newer.
+.SH OPTIONS
+.TP
+.BR \-i ", " \-\-interval " " \fISECONDS\fR
+How often processes and drives refresh, from 0.5 to 8 seconds (default 1).
+CPU, memory and network graphs sample twice as often.
+.TP
+.B \-\-no\-animation
+Update numbers instantly instead of easing them. Uses less CPU.
+.TP
+.B \-\-icons
+Use Nerd Font icons. This is the default when fontconfig knows a Nerd Font.
+.TP
+.B \-\-no\-icons
+Use plain symbols that every monospace font has.
+.TP
+.BI \-\-dump " COLS" x ROWS
+Print a single frame of that size to standard output and exit.
+.TP
+.BR \-V ", " \-\-version
+Print the version and exit.
+.TP
+.BR \-h ", " \-\-help
+Print a short usage summary and exit.
+.SH KEYS
+.TP
+.BR \(ua " " \(da ", " j " " k
+Move the selection.
+.B PgUp PgDn Home End
+jump.
+.TP
+.BR Enter ", click"
+Show details for the selected app or process.
+.TP
+.B /
+Search by name, command line or PID.
+.B Esc
+clears the search.
+.TP
+.B g
+Switch between apps (grouped by name) and individual processes.
+.TP
+.BR s ", " c ", " m ", " n ", " p ", " r
+Next sort; sort by CPU, memory, name or PID; reverse the sort.
+Clicking a column header also sorts.
+.TP
+.BR Del ", " x
+End the selected app nicely (SIGTERM), after confirming.
+.TP
+.BR Shift+Del ", " X
+Force-end it (SIGKILL), after confirming.
+.TP
+.B t
+Show or hide kernel tasks.
+.TP
+.B a
+Turn animations on or off.
+.TP
+.BR + " " \-
+Update faster or slower.
+.TP
+.BR ? ", " h ", " F1
+Show the guide.
+.TP
+.BR q ", " Ctrl+C
+Quit.
+.SH COLOURS
+shtop uses the first of these that exists:
+.IP 1. 4
+the file named by
+.BR SHTOP_THEME ;
+.IP 2. 4
+.IR ~/.config/shtop/colors.toml ;
+.IP 3. 4
+the current Omarchy theme,
+.IR ~/.local/state/omarchy/current/theme/colors.toml ,
+which is followed live as you switch themes;
+.IP 4. 4
+the terminal's own palette, asked for at startup with OSC 4/10/11 queries;
+.IP 5. 4
+a built-in palette.
+.PP
+A colours file uses the Omarchy
+.I colors.toml
+format: keys such as
+.BR background ,
+.BR foreground ,
+.BR accent ,
+.BR muted ,
+.BR selection ,
+.BR red ,
+.BR green ,
+.BR yellow ,
+.BR blue ,
+.BR magenta ,
+.B cyan
+and
+.BR orange ,
+each set to a
+.RI \(dq# rrggbb \(dq
+string. Missing keys fall back to the built-in palette. Files are re-read when
+they change.
+.SH ENVIRONMENT
+.TP
+.B SHTOP_THEME
+Path to a colours file that takes priority over all others.
+.TP
+.B SHTOP_ICONS
+.B 1
+or
+.B 0
+to force icons on or off when neither
+.B \-\-icons
+nor
+.B \-\-no\-icons
+is given.
+.TP
+.B XDG_CONFIG_HOME
+Where to look for
+.I shtop/colors.toml
+(default
+.IR ~/.config ).
+.SH SIGNALS
+.TP
+.B SIGUSR2
+Re-read the colours file now instead of within half a second.
+.SH SEE ALSO
+.BR btop (1),
+.BR htop (1),
+.BR top (1),
+.BR proc (5)
+.SH AUTHOR
+Shota Giorgobiani.
+Source and bug reports: https://github.com/giorgobiani/shtop

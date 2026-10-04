@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Version=1.5
+Name=shtop
+GenericName=System Monitor
+Comment=See what your computer is doing, in plain language
+Exec=shtop
+Icon=utilities-system-monitor
+Terminal=true
+Categories=System;Monitor;ConsoleOnly;
+Keywords=system;process;task;cpu;memory;network;disk;monitor;top;btop;htop;

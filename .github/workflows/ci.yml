@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m unittest discover -s tests -v
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install ruff
+      - run: ruff check .
+
+  arch:
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    steps:
+      - run: pacman -Syu --noconfirm --needed python make desktop-file-utils groff
+      - uses: actions/checkout@v4
+      - run: make test
+      - run: make install DESTDIR="$PWD/pkg" PREFIX=/usr
+      - run: test -x pkg/usr/bin/shtop && pkg/usr/bin/shtop --version
+      - run: desktop-file-validate shtop.desktop
+      - run: groff -man -Tutf8 -ww -z shtop.1

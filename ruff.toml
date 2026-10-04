@@ -1,0 +1,8 @@
+line-length = 120
+target-version = "py311"
+include = ["shtop", "tests/*.py"]
+
+[lint]
+select = ["E", "F", "W", "B", "UP", "SIM", "PIE"]
+# try/except/pass reads more plainly here than contextlib.suppress
+ignore = ["SIM105"]

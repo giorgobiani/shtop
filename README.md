@@ -49,7 +49,7 @@ Light themes work too:
 **Arch Linux and Omarchy**, the package from the latest release:
 
 ```bash
-sudo pacman -U https://github.com/giorgobiani/shtop/releases/download/v1.1.0/shtop-1.1.0-1-any.pkg.tar.zst
+sudo pacman -U https://github.com/giorgobiani/shtop/releases/download/v1.2.0/shtop-1.2.0-1-any.pkg.tar.zst
 ```
 
 Remove it with `sudo pacman -R shtop`. Or build the package yourself:
